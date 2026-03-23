@@ -42,8 +42,9 @@ const PITCH_FADER_RANGE: f32   = 0.16;
 
 /// Scrub (platter top touched): direct position control.  ~3 s per revolution.
 const SCRUB_SAMPLES_PER_COUNT: f64 = 0.025;
-/// Nudge (platter edge, no touch): light push, ~0.3 s per revolution.
-const NUDGE_SAMPLES_PER_COUNT: f64 = 0.003;
+/// Nudge (platter edge, no touch): speed offset per jog count.
+/// At a moderate spin (~500 counts/s) this gives roughly ±2% speed change.
+const NUDGE_SPEED_PER_COUNT: f32 = 0.00005;
 
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -106,6 +107,9 @@ fn run_loop(
     let mut touched      = false;
     // Calibrated on first HID report — start app with fader at center detent.
     let mut pitch_center: Option<u8> = None;
+    // The "true" speed set by the pitch fader; nudge offsets from this and
+    // snaps back when the jog comes to rest.
+    let mut base_speed: f32 = 1.0;
 
     loop {
         let n = match device.read_timeout(&mut buf, 100) {
@@ -152,16 +156,26 @@ fn run_loop(
                     raw_delta
                 };
 
-                if delta != 0 && touched {
-                    // Touch active: scrub — directly moves the playhead.
-                    // No touch: platter spins freely with no effect.
-                    let samples = (delta.abs() as f64 * SCRUB_SAMPLES_PER_COUNT) as u64;
-                    let pos = position.load(Ordering::Relaxed);
-                    if delta > 0 {
-                        position.store(pos.saturating_add(samples).min(max_pos), Ordering::Relaxed);
+                if delta != 0 {
+                    if touched {
+                        // Touch: scrub — directly moves the playhead.
+                        let samples = (delta.abs() as f64 * SCRUB_SAMPLES_PER_COUNT) as u64;
+                        let pos = position.load(Ordering::Relaxed);
+                        if delta > 0 {
+                            position.store(pos.saturating_add(samples).min(max_pos), Ordering::Relaxed);
+                        } else {
+                            position.store(pos.saturating_sub(samples), Ordering::Relaxed);
+                        }
                     } else {
-                        position.store(pos.saturating_sub(samples), Ordering::Relaxed);
+                        // No touch: nudge — temporary speed offset, visible in UI.
+                        // Positive delta (forward spin) = speed up; negative = slow down.
+                        let offset = delta as f32 * NUDGE_SPEED_PER_COUNT;
+                        let nudged = (base_speed + offset).clamp(0.25, 4.0);
+                        speed.store(nudged.to_bits(), Ordering::Relaxed);
                     }
+                } else if !touched {
+                    // Jog at rest and not touching: snap back to pitch fader base speed.
+                    speed.store(base_speed.to_bits(), Ordering::Relaxed);
                 }
             }
             prev_jog = Some(jog);
@@ -178,9 +192,10 @@ fn run_loop(
             });
             if raw != prev_btns[PITCH_FADER_BYTE] {
                 // offset > 0 → fader above center → faster
-                let offset    = center as f32 - raw as f32;
+                let offset     = center as f32 - raw as f32;
                 let half_range = center.max(1) as f32;
                 let new_speed  = (1.0 + offset / half_range * PITCH_FADER_RANGE).clamp(0.25, 4.0);
+                base_speed = new_speed;
                 speed.store(new_speed.to_bits(), Ordering::Relaxed);
                 log::debug!("S2 pitch fader: 0x{raw:02X} (center 0x{center:02X}) → {new_speed:.3}×");
             }
