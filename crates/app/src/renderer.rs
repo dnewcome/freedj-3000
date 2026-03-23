@@ -6,6 +6,7 @@
 
 use anyhow::{Context, Result};
 use opendeck_analysis::WaveformCache;
+use opendeck_types::BeatGrid;
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
 use winit::window::Window;
@@ -17,16 +18,20 @@ use winit::window::Window;
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct WaveformParams {
     /// Index of the column at the horizontal centre of the screen (float).
-    playhead_col: f32,
+    playhead_col:  f32,
     /// How many columns are visible across the full screen width.
     cols_visible:  f32,
     /// Total number of valid columns in the buffer.
-    num_cols:     f32,
+    num_cols:      f32,
     /// Surface width in pixels.
-    screen_w:     f32,
+    screen_w:      f32,
     /// Surface height in pixels.
-    screen_h:     f32,
-    _pad:         [f32; 3],
+    screen_h:      f32,
+    /// Beat grid: column index of anchor beat (0 if no grid).
+    beat_anchor_col: f32,
+    /// Beat grid: columns per beat (0 if no grid).
+    beat_period_cols: f32,
+    _pad:          f32,
 }
 
 // ── Renderer ──────────────────────────────────────────────────────────────────
@@ -123,12 +128,14 @@ impl Renderer {
 
         // ── Params uniform buffer ─────────────────────────────────────────────
         let initial_params = WaveformParams {
-            playhead_col:  0.0,
-            cols_visible:  600.0,
-            num_cols:      num_cols as f32,
-            screen_w:      size.width as f32,
-            screen_h:      size.height as f32,
-            _pad:          [0.0; 3],
+            playhead_col:      0.0,
+            cols_visible:      600.0,
+            num_cols:          num_cols as f32,
+            screen_w:          size.width as f32,
+            screen_h:          size.height as f32,
+            beat_anchor_col:   0.0,
+            beat_period_cols:  0.0,
+            _pad:              0.0,
         };
         let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label:    Some("waveform_params"),
@@ -250,8 +257,9 @@ impl Renderer {
     pub fn render(
         &mut self,
         playhead_sample:  u64,
-        _sample_rate:     u32,
+        sample_rate:      u32,
         channels:         u8,
+        beat_grid:        Option<&BeatGrid>,
         egui_ctx:         &egui::Context,
         full_output:      egui::FullOutput,
     ) {
@@ -263,13 +271,23 @@ impl Renderer {
         let hop_size     = opendeck_analysis::waveform::HOP_SIZE as f32;
         let playhead_col = playhead_sample as f32 / channels as f32 / hop_size;
 
+        let (beat_anchor_col, beat_period_cols) = beat_grid
+            .map(|g| {
+                let anchor = g.anchor_sample as f32 / channels as f32 / hop_size;
+                let period = (sample_rate as f32 * 60.0 / g.bpm as f32) / channels as f32 / hop_size;
+                (anchor, period)
+            })
+            .unwrap_or((0.0, 0.0));
+
         let params = WaveformParams {
             playhead_col,
-            cols_visible:  600.0,
-            num_cols:      self.num_cols as f32,
-            screen_w:      self.surface_config.width  as f32,
-            screen_h:      self.surface_config.height as f32,
-            _pad:          [0.0; 3],
+            cols_visible:      600.0,
+            num_cols:          self.num_cols as f32,
+            screen_w:          self.surface_config.width  as f32,
+            screen_h:          self.surface_config.height as f32,
+            beat_anchor_col,
+            beat_period_cols,
+            _pad:              0.0,
         };
         self.queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
 
@@ -361,14 +379,14 @@ const WAVEFORM_WGSL: &str = r#"
 //   bits 24-31: A (overall amplitude, controls bar height)
 
 struct Params {
-    playhead_col: f32,   // column index at screen center
-    cols_visible:  f32,  // columns visible across full width
-    num_cols:     f32,   // number of valid columns in the buffer
-    screen_w:     f32,
-    screen_h:     f32,
-    _pad0:        f32,
-    _pad1:        f32,
-    _pad2:        f32,
+    playhead_col:      f32,  // column index at screen center
+    cols_visible:      f32,  // columns visible across full width
+    num_cols:          f32,  // number of valid columns in the buffer
+    screen_w:          f32,
+    screen_h:          f32,
+    beat_anchor_col:   f32,  // column of beat 0 (0 = no grid)
+    beat_period_cols:  f32,  // columns per beat (0 = no grid)
+    _pad:              f32,
 };
 
 @group(0) @binding(0) var<storage, read> waveform: array<u32>;
@@ -409,6 +427,16 @@ fn fs_main(@builtin(position) frag_pos: vec4<f32>) -> @location(0) vec4<f32> {
     let g   = f32((packed >>  8u) & 0xFFu) / 255.0;
     let b   = f32((packed >> 16u) & 0xFFu) / 255.0;
     let amp = f32((packed >> 24u) & 0xFFu) / 255.0;
+
+    // Beat grid tick marks — full-height white lines at each beat position.
+    if p.beat_period_cols > 0.0 {
+        let rel      = col_f - p.beat_anchor_col;
+        let beat_pos = rel % p.beat_period_cols;
+        // 1-column-wide tick at the beat boundary.
+        if beat_pos < 1.0 || beat_pos > p.beat_period_cols - 1.0 {
+            return vec4<f32>(1.0, 1.0, 1.0, 0.35);
+        }
+    }
 
     // Bar chart centered vertically, height = amp.
     let dist = abs(sy - 0.5) * 2.0;

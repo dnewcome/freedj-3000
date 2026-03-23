@@ -13,7 +13,8 @@ mod renderer;
 
 use anyhow::{bail, Context, Result};
 use audio::AudioHandle;
-use opendeck_analysis::{WaveformBuilder, WaveformCache};
+use opendeck_analysis::{BeatAnalyzerImpl, WaveformBuilder, WaveformCache};
+use opendeck_types::{BeatAnalyzer, BeatGrid};
 use renderer::Renderer;
 use std::{
     path::PathBuf,
@@ -38,6 +39,7 @@ struct DeckApp {
     path:       PathBuf,
     waveform:   WaveformCache,
     audio:      AudioHandle,
+    beat_grid:  Option<BeatGrid>,
 
     // Created on first `resumed`.
     window:     Option<Arc<Window>>,
@@ -47,11 +49,12 @@ struct DeckApp {
 }
 
 impl DeckApp {
-    fn new(path: PathBuf, waveform: WaveformCache, audio: AudioHandle) -> Self {
+    fn new(path: PathBuf, waveform: WaveformCache, audio: AudioHandle, beat_grid: Option<BeatGrid>) -> Self {
         Self {
             path,
             waveform,
             audio,
+            beat_grid,
             window:     None,
             renderer:   None,
             egui_ctx:   egui::Context::default(),
@@ -108,6 +111,20 @@ impl DeckApp {
                             .color(egui::Color32::LIGHT_GRAY)
                             .monospace(),
                         );
+                        if let Some(grid) = &self.beat_grid {
+                            ui.separator();
+                            let conf = grid.confidence;
+                            let color = if conf >= 0.7 {
+                                egui::Color32::from_rgb(80, 220, 80)
+                            } else {
+                                egui::Color32::from_rgb(220, 180, 60)
+                            };
+                            ui.label(
+                                egui::RichText::new(format!("{:.1} BPM", grid.bpm))
+                                    .color(color)
+                                    .monospace(),
+                            );
+                        }
                         ui.separator();
                         ui.label(
                             egui::RichText::new("Space=play/pause  ←/→=seek  Q=quit")
@@ -125,6 +142,7 @@ impl DeckApp {
             pos,
             sr,
             self.audio.channels,
+            self.beat_grid.as_ref(),
             &self.egui_ctx,
             output,
         );
@@ -259,17 +277,25 @@ fn main() -> Result<()> {
     // ── 1. Decode audio ───────────────────────────────────────────────────────
     let audio = AudioHandle::open(&path)?;
 
-    // ── 2. Build waveform (synchronous — runs before window opens) ────────────
+    // ── 2. Build waveform + detect beat grid (synchronous, before window opens) ─
     log::info!("computing waveform ({} samples)...", audio.samples.len());
     let t0 = Instant::now();
-    let mut builder = WaveformBuilder::new(audio.sample_rate);
-    builder.push(&audio.samples);
-    let waveform = builder.finish();
-    log::info!(
-        "waveform done: {} columns in {:.1}s",
-        waveform.len(),
-        t0.elapsed().as_secs_f32()
-    );
+    let mut waveform_builder = WaveformBuilder::new(audio.sample_rate);
+    let mut beat_analyzer    = BeatAnalyzerImpl::new(audio.sample_rate);
+    waveform_builder.push(&audio.samples);
+    beat_analyzer.push(&audio.samples, audio.sample_rate);
+    let waveform  = waveform_builder.finish();
+    let beat_grid = beat_analyzer.beat_grid().map(|g| (*g).clone());
+    match &beat_grid {
+        Some(g) => log::info!(
+            "waveform done: {} columns, {:.1} BPM (confidence {:.2}) in {:.1}s",
+            waveform.len(), g.bpm, g.confidence, t0.elapsed().as_secs_f32()
+        ),
+        None => log::info!(
+            "waveform done: {} columns, BPM detection failed in {:.1}s",
+            waveform.len(), t0.elapsed().as_secs_f32()
+        ),
+    }
 
     // ── 3. Connect MIDI controller (optional — app runs fine without it) ─────────
     let _midi = midi::MidiHandle::connect(
@@ -284,7 +310,7 @@ fn main() -> Result<()> {
     let event_loop = EventLoop::new().context("failed to create event loop")?;
     event_loop.set_control_flow(ControlFlow::Poll);
 
-    let mut app = DeckApp::new(path, waveform, audio);
+    let mut app = DeckApp::new(path, waveform, audio, beat_grid);
     event_loop.run_app(&mut app).context("event loop error")?;
 
     Ok(())

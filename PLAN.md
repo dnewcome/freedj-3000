@@ -253,28 +253,41 @@ Keep NUC as a documented fallback path. The MCU bridge means the software archit
 
 ## Audio Engine
 
-### Timestretching
+### Timestretching [DECIDED]
 
-The quality of the timestretch algorithm is the most audible differentiator between mediocre and professional DMPs.
+The quality of the timestretch algorithm is the most audible differentiator between mediocre and professional DMPs. Unlike a DAW where timestretch is applied occasionally, on a DJ deck the signal is **always running through the timestretcher** — even at 1× speed it must be in the path for seamless pitch nudge response. This means artifacts are permanently audible and algorithm quality is a primary product differentiator.
 
-**Option 1: Rubber Band Library (LGPL)**
-- Best open-source option available
-- Two modes: R2 (low-latency, ~50ms), R3 (higher quality, ~100ms)
-- R2 is appropriate for live scratch/pitch nudge; R3 for key-locked pitch shift at playback speed
-- Rust bindings exist (`rubberband` crate)
-- Pioneer's algorithm is proprietary but Rubber Band R3 is competitive
+**Decision: Rubber Band Library R3 ("Finer" engine) via C FFI.**
 
-**Option 2: SoundTouch (LGPL)**
-- Older, lower quality than Rubber Band but lower CPU
-- Used in Mixxx — proven stable for live use
-- Fallback for underpowered hardware
+- No `rubberband` crate exists on crates.io — bindings written by hand against `rubberband-c.h`
+- System dependency: `librubberband-dev` (v3.3.0 on Ubuntu/Debian apt, LGPL 2.1+)
+- R3 engine selected (`RubberBandOptionEngineFiner`) — highest quality, acceptable latency (~100ms, handled by pre-roll)
+- R2 engine (`RubberBandOptionEngineDefault`) retained as a fallback option for constrained hardware
 
-**Option 3: Phase vocoder (custom)**
-- Highest quality possible (Zplane élastique quality)
-- Very high implementation complexity
-- Stretch goal for v2+
+**WSOLA explicitly rejected.** Good quality only for ±8% ratios, audible transient smearing at larger shifts. Not acceptable for a product competing with Pioneer.
 
-**Recommendation:** Ship with Rubber Band R2 for responsive playback. Add R3 as an optional high-quality mode for non-scratch use. Profile on RPi 5 — R2 at 256-sample buffers should be well within budget.
+**SoundTouch explicitly rejected.** Lower quality than Rubber Band, used in Mixxx as a pragmatic choice, not a quality one.
+
+**Audio pipeline architecture (required for variable-speed playback):**
+
+```
+Decoded PCM (Arc<Vec<f32>>)
+    │
+    ▼
+Processor thread  ──── speed: AtomicF32 (0.5–2.0)
+    │                   key_lock: AtomicBool
+    │   key-lock ON:  Rubber Band R3 (pitch preserved)
+    │   key-lock OFF: read at adjusted rate (pitch follows speed, vinyl feel)
+    ▼
+rtrb SPSC ring buffer  (~8192 frames, pre-allocated)
+    │
+    ▼
+cpal callback  (drains ring buffer, outputs to hardware)
+```
+
+The position `AtomicU64` is updated by the processor thread after each consumed block. The waveform renderer reads it each frame for scroll position — no change needed there.
+
+**Build requirement:** `sudo apt install librubberband-dev`
 
 ### Slip/Flux Mode
 
@@ -297,14 +310,28 @@ struct SlipState {
 
 The audio callback always outputs from `visible_pos`. On slip release, it schedules a crossfade from current buffer into ghost position stream over ~10ms.
 
-### Beat Detection and Quantize
+### Beat Detection and Quantize [DECIDED]
 
-- Offline analysis: full beat grid computed when track is loaded into library
-- Online (live) analysis: streaming BPM tap / beat detection for tracks not yet analyzed
-- Quantize mode: cue points and loop points snap to nearest beat grid position
-- Beat grid can be manually corrected via UI (drag grid anchor, adjust BPM)
+**Decision: pure Rust implementation in `crates/analysis`, runs synchronously at track load.**
 
-Library: **BeatRoot** algorithm (well-researched) or **madmom** (best accuracy, but Python — run offline only). Essentia's BeatTrackerMultiFeature is also excellent and has a C++ API usable from Rust via FFI.
+Pipeline (implemented in `crates/analysis/src/beat.rs`):
+1. Bass-focused onset strength signal (80–400 Hz bandpass IIR + half-wave rectify + differentiate)
+2. Autocorrelation over 6-second window → BPM + confidence score
+3. Phase estimation by maximising onset energy at grid positions → anchor sample
+4. Downbeat detection (bar structure) — TODO
+
+Result stored as `BeatGrid` (anchor_sample + BPM for constant-tempo, per-beat sample array for variable). Runs in <0.1s on a 5-minute track.
+
+**Beat grid displayed on waveform** as vertical tick marks in the WGSL fragment shader. Beat period computed from BPM + sample rate, ticks drawn as faint vertical lines at the correct column offsets from the anchor.
+
+**BPM shown in egui header overlay** alongside time/filename.
+
+Essentia/madmom path remains viable for a future "deep analysis" mode on library import — better accuracy for complex material. Not needed for MVP.
+
+- Offline analysis: full beat grid computed when track is loaded into library ✅
+- Online (live) analysis: streaming BPM tap / beat detection for tracks not yet analyzed — TODO
+- Quantize mode: cue points and loop points snap to nearest beat grid position — TODO
+- Beat grid can be manually corrected via UI — TODO
 
 ### Latency Budget
 
@@ -589,19 +616,24 @@ The fragment shader does almost nothing — the waveform color data is pre-baked
 
 ### Phase 0: Feasibility (1–2 months)
 - [ ] Benchmark Rubber Band R2/R3 on RPi 5 (two decks, 256-sample buffer)
-- [ ] Prototype audio engine skeleton in Rust (cpal → ALSA, RT thread, slip state machine)
+- [x] Prototype audio engine skeleton in Rust (cpal → ALSA, RT thread, slip state machine)
 - [ ] Prototype MCU firmware on RP2350 devboard (jog wheel encoder + USB HID)
 - [ ] Verify 10ms latency target with oscilloscope measurement
 - [ ] Patent search: eddy current platter mechanism
 
 ### Phase 1: Software MVP (3–4 months)
-- [ ] Audio engine: decode, timestretch, play/pause, pitch nudge, sync
+- [x] Audio decode (MP3/FLAC/AAC/OGG/WAV/AIFF via Symphonia)
+- [x] Waveform visualization (FFT-based frequency-colored, GPU storage buffer, WGSL shader)
+- [x] Play / pause / seek (keyboard + S2 MK2 HID)
+- [x] Jog wheel scrub + nudge (S2 MK2, touch-sensitive)
+- [ ] **Beat grid detection + BPM display** ← in progress
+- [ ] **Rubber Band R3 timestretching + speed control** ← in progress
+- [ ] Beat grid markers on waveform
 - [ ] Slip/flux mode
-- [ ] Beat grid detection (offline analysis pipeline)
 - [ ] Hot cues (8), memory cues, basic loops
 - [ ] SQLite media library with USB/SD mount support
-- [ ] Basic UI (waveform + track browser) on 7" display
-- [ ] MCU firmware: all controls, USB HID, SPI
+- [ ] Full UI (waveform + track browser) on 7" display
+- [ ] Custom RP2350 MCU firmware + hardware
 - [ ] Ableton Link sync
 
 ### Phase 2: Feature Complete (3–4 months)
@@ -644,3 +676,18 @@ The fragment shader does almost nothing — the waveform color data is pre-baked
 ---
 
 *This document is a living plan. Decisions should be updated here before implementation begins. Nothing in this plan is final until marked with [DECIDED].*
+
+---
+
+## Decisions Log
+
+Decisions made during active development. Cross-referenced to the sections above.
+
+| Date | Decision | Rationale |
+|---|---|---|
+| 2026-03-23 | Graphics: wgpu 22 + egui 0.29 + winit 0.30 [DECIDED] | Slint rejected (retained mode, wrong model). sokol rejected (C FFI, DRM/KMS friction). wgpu + egui delivers game-HUD rendering with no C++ deps. |
+| 2026-03-23 | Waveform storage: GPU storage buffer, not texture [DECIDED] | GLES max texture dimension is 2048 — waveform for a 5-min track at HOP=512 exceeds this. Storage buffers have no dimension limit. Each column packed as u32 (RGBA bytes). |
+| 2026-03-23 | Beat detection: pure Rust in crates/analysis, not Python [DECIDED] | Autocorrelation + onset strength runs in <0.1s on full track. No Python dep needed for offline analysis. Python/Essentia path retained as optional future upgrade for higher accuracy. |
+| 2026-03-23 | Timestretching: Rubber Band R3 via hand-written C FFI [DECIDED] | No `rubberband` crate on crates.io. WSOLA explicitly rejected — not good enough quality for a pro product where timestretch is always in the signal path. Rubber Band R3 ("Finer" engine) is the correct choice. FFI bindings written directly against the Rubber Band C API (`rubberband-c.h`). System dep: `librubberband-dev` (v3.3.0 available in apt). |
+| 2026-03-23 | Audio pipeline: processor thread + rtrb ring buffer [DECIDED] | Direct callback read from sample buffer cannot support variable speed. Processor thread runs Rubber Band, writes to rtrb SPSC queue, cpal callback drains it. Position AtomicU64 updated by processor thread. |
+| 2026-03-23 | Dev control surface: Traktor Kontrol S2 MK2 (temporary) [DECIDED] | USB HID, proprietary NI protocol. Jog wheel = 24-bit absolute position counter in bytes [3,2,1] (MSB first). Touch sensor = byte[10] bit 0x01. Play = byte[11] bit 0x01. Cue = byte[11] bit 0x02. Not a long-term target — replaced by custom RP2350 hardware. |

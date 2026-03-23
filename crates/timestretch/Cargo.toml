@@ -5,9 +5,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[build-dependencies]
+pkg-config = "0.3"
+
 [dependencies]
 opendeck-types = { workspace = true }
 rubato         = { workspace = true }
-# rubberband not yet available; will add when sys crate is published or vendored
-# rubberband     = { workspace = true }
 log            = { workspace = true }
