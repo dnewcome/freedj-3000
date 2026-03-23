@@ -198,20 +198,28 @@ fn run_loop(
         // ── Pitch fader — byte 7, absolute ────────────────────────────────────
         if PITCH_FADER_BYTE < n {
             let raw = report[PITCH_FADER_BYTE];
-            // Latch center from the very first report (app must start with
-            // fader at the center detent).
-            let center = *pitch_center.get_or_insert_with(|| {
-                log::info!("S2 pitch fader: center calibrated at 0x{raw:02X}");
-                raw
-            });
-            if raw != prev_btns[PITCH_FADER_BYTE] {
-                // offset > 0 → fader above center → faster
-                let offset     = center as f32 - raw as f32;
-                let half_range = center.max(1) as f32;
-                let new_speed  = (1.0 + offset / half_range * PITCH_FADER_RANGE).clamp(0.25, 4.0);
-                base_speed = new_speed;
-                speed.store(new_speed.to_bits(), Ordering::Relaxed);
-                log::debug!("S2 pitch fader: 0x{raw:02X} (center 0x{center:02X}) → {new_speed:.3}×");
+            match pitch_center {
+                None => {
+                    // First report: latch center, set base_speed = 1.0.
+                    pitch_center = Some(raw);
+                    log::info!("S2 pitch fader: center calibrated at 0x{raw:02X}");
+                    base_speed = 1.0;
+                    speed.store(1.0f32.to_bits(), Ordering::Relaxed);
+                }
+                Some(center) => {
+                    // Only update if moved by >1 count; filters single-count ADC
+                    // jitter which would otherwise corrupt base_speed and cause
+                    // snap-back to land at a slightly wrong value.
+                    let prev = prev_btns[PITCH_FADER_BYTE];
+                    if (raw as i32 - prev as i32).abs() > 1 {
+                        let offset     = center as f32 - raw as f32;
+                        let half_range = center.max(1) as f32;
+                        let new_speed  = (1.0 + offset / half_range * PITCH_FADER_RANGE).clamp(0.25, 4.0);
+                        base_speed = new_speed;
+                        speed.store(new_speed.to_bits(), Ordering::Relaxed);
+                        log::debug!("S2 pitch fader: 0x{raw:02X} (center 0x{center:02X}) → {new_speed:.3}×");
+                    }
+                }
             }
         }
 
