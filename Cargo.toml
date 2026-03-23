@@ -1,0 +1,99 @@
+[workspace]
+members = [
+    "crates/types",
+    "crates/protocol",
+    "crates/engine",
+    "crates/decode",
+    "crates/analysis",
+    "crates/timestretch",
+    "crates/timecode",
+    "crates/link",
+    "crates/db",
+    "crates/ui",
+    "crates/app",
+]
+resolver = "2"
+
+[workspace.package]
+version     = "0.1.0"
+edition     = "2021"
+license     = "GPL-2.0-or-later"
+authors     = ["OpenDeck contributors"]
+repository  = "https://github.com/opendeck/opendeck"
+
+# Centralized dependency versions — all crates reference these via workspace = true
+[workspace.dependencies]
+# Internal crates
+opendeck-types       = { path = "crates/types" }
+opendeck-protocol    = { path = "crates/protocol" }
+opendeck-engine      = { path = "crates/engine" }
+opendeck-decode      = { path = "crates/decode" }
+opendeck-analysis    = { path = "crates/analysis" }
+opendeck-timestretch = { path = "crates/timestretch" }
+opendeck-timecode    = { path = "crates/timecode" }
+opendeck-link        = { path = "crates/link" }
+opendeck-db          = { path = "crates/db" }
+opendeck-ui          = { path = "crates/ui" }
+
+# Audio I/O
+cpal        = { version = "0.15" }
+
+# Lock-free ring buffer — the only data structure in the RT audio path
+rtrb        = "0.3"
+
+# Audio decoding — pure Rust, no system lib dependency
+symphonia   = { version = "0.5", features = [
+    "mp3", "aac", "flac", "wav", "aiff", "ogg", "vorbis"
+] }
+
+# Resampling (no-keylock speed change) — pure Rust
+rubato      = "0.15"
+
+# Timestretching (key-lock speed change) — wraps Rubber Band C++ lib
+# rubberband crate is not yet published; link against librubberband via -sys crate when ready
+# rubberband  = "0.2"
+
+# Beat analysis
+aubio       = "0.2"
+
+# Graphics
+wgpu        = "0.20"
+winit       = "0.30"
+egui        = "0.28"
+egui-wgpu   = "0.28"
+egui-winit  = "0.28"
+
+# Text rendering
+glyphon     = "0.5"
+
+# Database
+rusqlite    = { version = "0.31", features = ["bundled"] }
+
+# Networking (ProDJ Link, Ableton Link)
+tokio       = { version = "1", features = ["full"] }
+socket2     = "0.5"
+
+# Shared state between threads
+arc-swap    = "1"
+
+# Serialization (MCU protocol, DB blobs)
+bytemuck    = { version = "1", features = ["derive"] }
+serde       = { version = "1", features = ["derive"] }
+bincode     = "2"
+
+# Utilities
+log         = "0.4"
+env_logger  = "0.11"
+thiserror   = "1"
+anyhow      = "1"
+pollster    = "0.3"
+
+[profile.release]
+opt-level   = 3
+lto         = "thin"
+codegen-units = 1
+
+# The audio engine binary must never be a debug build in prod.
+# Use: cargo build --release -p opendeck-app
+[profile.dev]
+opt-level   = 1   # faster builds, still reasonable audio perf for dev

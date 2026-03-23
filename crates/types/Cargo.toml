@@ -1,0 +1,12 @@
+[package]
+name        = "opendeck-types"
+description = "Core types and traits shared across all OpenDeck crates"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+arc-swap  = { workspace = true }
+bytemuck  = { workspace = true }
+serde     = { workspace = true }
+thiserror = { workspace = true }

@@ -1,0 +1,16 @@
+[package]
+name        = "opendeck-ui"
+description = "wgpu + egui immediate mode UI — waveform, pads, track browser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+opendeck-types    = { workspace = true }
+opendeck-analysis = { workspace = true }
+wgpu              = { workspace = true }
+winit             = { workspace = true }
+egui              = { workspace = true }
+egui-wgpu         = { workspace = true }
+egui-winit        = { workspace = true }
+log               = { workspace = true }

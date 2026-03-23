@@ -1,0 +1,9 @@
+[package]
+name        = "opendeck-protocol"
+description = "MCU↔host packet protocol — no_std compatible for future MCU firmware sharing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bytemuck = { workspace = true }

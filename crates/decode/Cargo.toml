@@ -1,0 +1,13 @@
+[package]
+name        = "opendeck-decode"
+description = "Media decoding and read-ahead thread"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+opendeck-types = { workspace = true }
+symphonia      = { workspace = true }
+rtrb           = { workspace = true }
+log            = { workspace = true }
+thiserror      = { workspace = true }

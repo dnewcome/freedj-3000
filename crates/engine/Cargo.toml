@@ -1,0 +1,13 @@
+[package]
+name        = "opendeck-engine"
+description = "Real-time audio engine — transport, slip mode, cue/loop engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+opendeck-types    = { workspace = true }
+opendeck-protocol = { workspace = true }
+rtrb              = { workspace = true }
+arc-swap          = { workspace = true }
+log               = { workspace = true }

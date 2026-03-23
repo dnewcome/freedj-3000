@@ -1,0 +1,13 @@
+[package]
+name        = "opendeck-db"
+description = "SQLite library database — tracks, cue points, beat grids, playlists"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+opendeck-types = { workspace = true }
+rusqlite       = { workspace = true }
+serde          = { workspace = true }
+log            = { workspace = true }
+thiserror      = { workspace = true }

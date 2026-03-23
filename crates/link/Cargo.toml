@@ -1,0 +1,13 @@
+[package]
+name        = "opendeck-link"
+description = "ProDJ Link (Pioneer CDJ sync) and Ableton Link network protocols"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+opendeck-types = { workspace = true }
+tokio          = { workspace = true }
+socket2        = { workspace = true }
+log            = { workspace = true }
+thiserror      = { workspace = true }

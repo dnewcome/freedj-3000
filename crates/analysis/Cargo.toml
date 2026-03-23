@@ -1,0 +1,11 @@
+[package]
+name        = "opendeck-analysis"
+description = "Beat grid detection and waveform pre-computation — offline and streaming"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+opendeck-types = { workspace = true }
+rustfft        = "6"
+log            = { workspace = true }
