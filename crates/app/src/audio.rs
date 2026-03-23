@@ -39,8 +39,17 @@ use std::{
 const BLOCK_FRAMES: usize = 512;
 
 /// Ring buffer capacity in device samples (not frames).
-/// 2 seconds at 48kHz stereo = 192 000 — rounded up to next comfortable size.
+/// 2 seconds at 48kHz stereo ≈ 192 000.
 const RING_BUFFER_SAMPLES: usize = 200_000;
+
+/// Back-pressure threshold: minimum free slots in the ring buffer before
+/// we'll process another block.
+///
+/// At 0.25× speed RubberBand outputs 4× the input frames, so we need room
+/// for up to BLOCK_FRAMES × 4 output frames × device channels.  8× gives
+/// comfortable headroom.  With a 200 K sample ring buffer this is never
+/// close to full during normal use.
+const BACK_PRESSURE_SLOTS: usize = BLOCK_FRAMES * 8 * 2; // 2 = max device channels
 
 /// If position jumps by more than this many source samples the processor
 /// treats it as a seek and resets the timestretch engine.
@@ -226,12 +235,24 @@ fn processor_loop(
 ) {
     let mut stretcher = TimestretechStage::new(sample_rate, file_ch as u8);
 
+    // ── Pre-roll: push silence to warm up the RubberBand engine ──────────────
+    // The R3 engine needs latency_frames of input before it produces output.
+    // Without this, the first ~100ms of playback is silent (ring buffer stays
+    // empty while RubberBand fills its internal pipeline).
+    {
+        let latency = stretcher.latency_frames();
+        let silence = vec![0.0f32; latency * file_ch];
+        let mut warmup = Vec::new();
+        stretcher.process(&silence, &mut warmup);
+        log::debug!("proc: pre-rolled {latency} silence frames");
+    }
+
     // Internal read cursor — the processor owns this, UI/HID may jump `position`
     // to trigger a seek.
     let mut proc_pos: u64 = 0;
 
     // Output buffer for timestretched (file_ch interleaved) audio.
-    let mut ts_out: Vec<f32> = Vec::with_capacity(BLOCK_FRAMES * file_ch * 2);
+    let mut ts_out: Vec<f32> = Vec::with_capacity(BLOCK_FRAMES * file_ch * 8);
 
     loop {
         // ── Pause handling ────────────────────────────────────────────────────
@@ -246,13 +267,16 @@ fn processor_loop(
             log::debug!("proc: seek detected {proc_pos} → {shared_pos}");
             stretcher.reset();
             proc_pos = shared_pos;
-            // Tell the cpal callback to flush its buffer.
+            // Tell the cpal callback to flush stale buffered audio.
             drain_flag.store(true, Ordering::Release);
         }
 
-        // ── Back-pressure — don't flood the ring buffer ───────────────────────
-        let needed = BLOCK_FRAMES * device_ch;
-        if producer.slots() < needed {
+        // ── Back-pressure ─────────────────────────────────────────────────────
+        // At speeds below 1.0×, RubberBand outputs more frames than it takes in
+        // (e.g. at 0.25× it outputs 4× input frames).  BACK_PRESSURE_SLOTS is
+        // sized at 8× BLOCK_FRAMES × device_ch to guarantee we always have room
+        // for the worst-case output before we process the next block.
+        if producer.slots() < BACK_PRESSURE_SLOTS {
             thread::sleep(Duration::from_millis(1));
             continue;
         }
@@ -268,8 +292,7 @@ fn processor_loop(
         let src_end   = (src_start + BLOCK_FRAMES * file_ch).min(samples.len());
         let src_block = &samples[src_start..src_end];
 
-        let actual_frames = (src_end - src_start) / file_ch;
-        let final_block   = src_end >= samples.len();
+        let final_block = src_end >= samples.len();
 
         // Advance the shared position so the UI/renderer sees it.
         proc_pos = src_end as u64;
@@ -284,20 +307,26 @@ fn processor_loop(
         stretcher.process(src_block, &mut ts_out);
 
         if final_block && ts_out.is_empty() {
-            // Push end-of-track silence to flush RubberBand's internal buffers.
+            // Flush RubberBand's tail at end of track.
             let silence = vec![0.0f32; BLOCK_FRAMES * file_ch];
             stretcher.process(&silence, &mut ts_out);
         }
 
         // ── Channel mix & push to ring buffer ─────────────────────────────────
-        let out_frames = ts_out.len() / file_ch;
-        _ = actual_frames; // used implicitly via ts_out length
+        // Cap to available slots so we never silently drop frames.
+        let out_frames    = ts_out.len() / file_ch;
+        let slots_free    = producer.slots();
+        let frames_to_push = out_frames.min(slots_free / device_ch);
 
-        for i in 0..out_frames {
+        if frames_to_push < out_frames {
+            log::warn!("proc: ring buffer full, dropped {} frames", out_frames - frames_to_push);
+        }
+
+        for i in 0..frames_to_push {
             for dev_ch_idx in 0..device_ch {
                 let src_ch = dev_ch_idx.min(file_ch - 1);
-                let sample = ts_out[i * file_ch + src_ch];
-                let _ = producer.push(sample); // ignore if full (shouldn't happen)
+                // producer.push() can't fail here — we checked slots_free above
+                let _ = producer.push(ts_out[i * file_ch + src_ch]);
             }
         }
     }

@@ -35,8 +35,8 @@ const MAP_SEEK_REV: (usize, u8) = (0xFF, 0xFF);
 const PITCH_FADER_BYTE:   usize = 7;
 /// Raw byte value that corresponds to 1.0× (fader at center detent).
 const PITCH_FADER_CENTER: u8   = 0x40;
-/// ±% pitch range — 0.08 = ±8% (CDJ-3000 default).  Max = 0.50 (±50%).
-const PITCH_FADER_RANGE:  f32  = 0.08;
+/// ±% pitch range — 0.16 = ±16% (wide DJ range).  CDJ-3000 default is 0.08 (±8%).
+const PITCH_FADER_RANGE:  f32  = 0.16;
 
 // ── Jog wheel sensitivity ─────────────────────────────────────────────────────
 // The 24-bit counter spans ~16.7M counts per full revolution.
