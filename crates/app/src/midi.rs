@@ -43,9 +43,10 @@ const PITCH_FADER_RANGE: f32   = 0.16;
 
 /// Scrub (platter top touched): direct position control.  ~3 s per revolution.
 const SCRUB_SAMPLES_PER_COUNT: f64 = 0.025;
-/// Nudge (platter edge, no touch): speed offset per jog count per 100 ms poll.
-/// Tune so a slow steady spin gives ~1% offset.
-const NUDGE_SPEED_PER_COUNT: f32 = 0.0001;
+/// Nudge speed offset per jog count.
+/// The encoder produces ~10M counts/rev; at a slow nudge spin (~0.25 rev/s)
+/// that's ~250K counts per 100ms poll.  5e-8 × 250K ≈ 1.25% offset.
+const NUDGE_SPEED_PER_COUNT: f32 = 0.00000005;
 
 /// How long the jog must be idle before speed snaps back to the pitch fader value.
 const NUDGE_RELEASE_MS: u128 = 150;
