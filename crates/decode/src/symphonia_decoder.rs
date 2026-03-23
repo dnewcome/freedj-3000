@@ -85,12 +85,15 @@ impl Decoder for SymphoniaDecoder {
             let decoded = self.decoder.decode(&packet)
                 .map_err(|e| DecodeError::Codec(e.to_string()))?;
 
-            let spec = *decoded.spec();
+            let spec   = *decoded.spec();
             let frames = decoded.frames();
+            let needed = frames * spec.channels.count();
 
-            let buf = self.sample_buf.get_or_insert_with(|| {
-                SampleBuffer::<f32>::new(frames as u64, spec)
-            });
+            // Reallocate if the buffer is absent or too small for this packet.
+            if self.sample_buf.as_ref().map_or(true, |b| b.capacity() < needed) {
+                self.sample_buf = Some(SampleBuffer::<f32>::new(frames as u64, spec));
+            }
+            let buf = self.sample_buf.as_mut().unwrap();
             buf.copy_interleaved_ref(decoded);
 
             let samples = buf.samples();

@@ -17,7 +17,7 @@ use renderer::Renderer;
 use std::{
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::Ordering,
         Arc,
     },
     time::Instant,
@@ -80,7 +80,7 @@ impl DeckApp {
         let mut output = self.egui_ctx.run(raw, |ctx| {
             // Transparent panel at the top.
             egui::TopBottomPanel::top("info")
-                .frame(egui::Frame::new().fill(egui::Color32::from_black_alpha(160)))
+                .frame(egui::Frame::default().fill(egui::Color32::from_black_alpha(160)))
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
                         ui.label(

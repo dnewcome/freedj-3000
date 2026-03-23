@@ -57,11 +57,11 @@ rubato      = "0.15"
 aubio       = "0.2"
 
 # Graphics
-wgpu        = "0.20"
+wgpu        = "22"
 winit       = "0.30"
-egui        = "0.28"
-egui-wgpu   = "0.28"
-egui-winit  = "0.28"
+egui        = "0.29"
+egui-wgpu   = "0.29"
+egui-winit  = "0.29"
 
 # Text rendering
 glyphon     = "0.5"

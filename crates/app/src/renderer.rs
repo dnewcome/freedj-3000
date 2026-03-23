@@ -1,7 +1,7 @@
 //! wgpu + egui renderer for the MVP waveform display.
 //!
 //! Two render passes per frame:
-//!   Pass 1 — custom waveform shader (fullscreen quad, scrolling texture)
+//!   Pass 1 — custom waveform shader (fullscreen quad, scrolling storage buffer)
 //!   Pass 2 — egui overlay (time counter, play state, instructions)
 
 use anyhow::{Context, Result};
@@ -20,15 +20,13 @@ struct WaveformParams {
     playhead_col: f32,
     /// How many columns are visible across the full screen width.
     cols_visible:  f32,
-    /// Total number of valid columns in the texture.
+    /// Total number of valid columns in the buffer.
     num_cols:     f32,
-    /// Actual texture width (may be padded to satisfy alignment).
-    tex_width:    f32,
     /// Surface width in pixels.
     screen_w:     f32,
     /// Surface height in pixels.
     screen_h:     f32,
-    _pad:         [f32; 2],
+    _pad:         [f32; 3],
 }
 
 // ── Renderer ──────────────────────────────────────────────────────────────────
@@ -44,7 +42,6 @@ pub struct Renderer {
     waveform_bind_group: wgpu::BindGroup,
     params_buf:          wgpu::Buffer,
     num_cols:            u32,
-    tex_width:           u32,   // padded texture width
 
     // egui pass
     egui_renderer:  egui_wgpu::Renderer,
@@ -110,62 +107,28 @@ impl Renderer {
         };
         surface.configure(&device, &surface_config);
 
-        // ── Waveform texture ──────────────────────────────────────────────────
-        // Texture is 1-pixel tall, N columns wide.
-        // bytes_per_row must be a multiple of 256 = COPY_BYTES_PER_ROW_ALIGNMENT.
-        // Rgba8 = 4 bytes/pixel, so width must be a multiple of 64.
+        // ── Waveform storage buffer ───────────────────────────────────────────
+        // Pack each [R,G,B,A] column into a single u32 (little-endian bytes).
+        // No texture dimension limits — storage buffers handle arbitrary sizes.
         let num_cols = waveform.len() as u32;
-        let tex_width = (num_cols + 63) & !63;  // round up to multiple of 64
+        let waveform_data: Vec<u32> = waveform.columns.iter()
+            .map(|col| u32::from_le_bytes(*col))
+            .collect();
 
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label:             Some("waveform"),
-            size:              wgpu::Extent3d { width: tex_width, height: 1, depth_or_array_layers: 1 },
-            mip_level_count:   1,
-            sample_count:      1,
-            dimension:         wgpu::TextureDimension::D2,
-            format:            wgpu::TextureFormat::Rgba8Unorm,
-            usage:             wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats:      &[],
-        });
-
-        // Build padded RGBA data (zero-pad any unused columns at the end).
-        let bytes_per_row = tex_width * 4;
-        let mut tex_data  = vec![0u8; (bytes_per_row) as usize];
-        for (i, col) in waveform.columns.iter().enumerate() {
-            let off = i * 4;
-            tex_data[off..off + 4].copy_from_slice(col);
-        }
-
-        queue.write_texture(
-            texture.as_image_copy(),
-            &tex_data,
-            wgpu::ImageDataLayout {
-                offset:         0,
-                bytes_per_row:  Some(bytes_per_row),
-                rows_per_image: Some(1),
-            },
-            wgpu::Extent3d { width: tex_width, height: 1, depth_or_array_layers: 1 },
-        );
-
-        let tex_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let sampler  = device.create_sampler(&wgpu::SamplerDescriptor {
-            label:        Some("waveform_sampler"),
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            mag_filter:   wgpu::FilterMode::Linear,
-            min_filter:   wgpu::FilterMode::Linear,
-            ..Default::default()
+        let waveform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label:    Some("waveform_data"),
+            contents: bytemuck::cast_slice(&waveform_data),
+            usage:    wgpu::BufferUsages::STORAGE,
         });
 
         // ── Params uniform buffer ─────────────────────────────────────────────
         let initial_params = WaveformParams {
             playhead_col:  0.0,
-            cols_visible:  300.0,
+            cols_visible:  600.0,
             num_cols:      num_cols as f32,
-            tex_width:     tex_width as f32,
             screen_w:      size.width as f32,
             screen_h:      size.height as f32,
-            _pad:          [0.0; 2],
+            _pad:          [0.0; 3],
         };
         let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label:    Some("waveform_params"),
@@ -177,24 +140,20 @@ impl Renderer {
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label:   Some("waveform_bgl"),
             entries: &[
+                // binding 0: waveform storage buffer (read-only)
                 wgpu::BindGroupLayoutEntry {
                     binding:    0,
                     visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        multisampled:   false,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        sample_type:    wgpu::TextureSampleType::Float { filterable: true },
+                    ty: wgpu::BindingType::Buffer {
+                        ty:                 wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size:   None,
                     },
                     count: None,
                 },
+                // binding 1: params uniform
                 wgpu::BindGroupLayoutEntry {
                     binding:    1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding:    2,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty:                 wgpu::BufferBindingType::Uniform,
@@ -210,9 +169,8 @@ impl Renderer {
             label:  Some("waveform_bg"),
             layout: &bind_group_layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&tex_view) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&sampler) },
-                wgpu::BindGroupEntry { binding: 2, resource: params_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 0, resource: waveform_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: params_buf.as_entire_binding() },
             ],
         });
 
@@ -233,13 +191,13 @@ impl Renderer {
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module:      &shader,
-                entry_point: Some("vs_main"),
+                entry_point: "vs_main",
                 buffers:     &[],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
                 module:      &shader,
-                entry_point: Some("fs_main"),
+                entry_point: "fs_main",
                 targets:     &[Some(wgpu::ColorTargetState {
                     format:     format,
                     blend:      None,
@@ -274,7 +232,6 @@ impl Renderer {
             waveform_bind_group,
             params_buf,
             num_cols,
-            tex_width,
             egui_renderer,
             egui_screen,
         })
@@ -290,15 +247,10 @@ impl Renderer {
         self.egui_screen.size_in_pixels = [width, height];
     }
 
-    /// Render one frame.
-    ///
-    /// `playhead_sample`: current play position in PCM samples.
-    /// `sample_rate`: the track's sample rate (samples per second per channel).
-    /// `channels`: channel count (2 for stereo).
     pub fn render(
         &mut self,
         playhead_sample:  u64,
-        sample_rate:      u32,
+        _sample_rate:     u32,
         channels:         u8,
         egui_ctx:         &egui::Context,
         full_output:      egui::FullOutput,
@@ -306,19 +258,18 @@ impl Renderer {
         let pixels_per_point = full_output.pixels_per_point;
         let egui_shapes      = full_output.shapes;
         let textures_delta   = full_output.textures_delta;
+
         // ── Update waveform scroll params ─────────────────────────────────────
-        let hop_size  = opendeck_analysis::waveform::HOP_SIZE as f32;
+        let hop_size     = opendeck_analysis::waveform::HOP_SIZE as f32;
         let playhead_col = playhead_sample as f32 / channels as f32 / hop_size;
-        let cols_visible = 600.0_f32;  // tune for desired zoom level
 
         let params = WaveformParams {
             playhead_col,
-            cols_visible,
-            num_cols:  self.num_cols as f32,
-            tex_width: self.tex_width as f32,
-            screen_w:  self.surface_config.width  as f32,
-            screen_h:  self.surface_config.height as f32,
-            _pad:      [0.0; 2],
+            cols_visible:  600.0,
+            num_cols:      self.num_cols as f32,
+            screen_w:      self.surface_config.width  as f32,
+            screen_h:      self.surface_config.height as f32,
+            _pad:          [0.0; 3],
         };
         self.queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
 
@@ -357,7 +308,6 @@ impl Renderer {
         }
 
         // ── Pass 2: egui overlay ──────────────────────────────────────────────
-        // Upload any new/changed textures (e.g. font atlas) before tessellating.
         for (id, delta) in &textures_delta.set {
             self.egui_renderer.update_texture(&self.device, &self.queue, *id, delta);
         }
@@ -374,20 +324,22 @@ impl Renderer {
             &self.egui_screen,
         );
         {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("egui_pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view:           &view,
-                    resolve_target: None,
-                    ops:            wgpu::Operations {
-                        load:  wgpu::LoadOp::Load,  // don't clear — keep waveform
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                occlusion_query_set:      None,
-                timestamp_writes:         None,
-            });
+            let mut pass = encoder
+                .begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("egui_pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view:           &view,
+                        resolve_target: None,
+                        ops:            wgpu::Operations {
+                            load:  wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    occlusion_query_set:      None,
+                    timestamp_writes:         None,
+                })
+                .forget_lifetime();
             self.egui_renderer.render(&mut pass, &primitives, &self.egui_screen);
         }
 
@@ -398,36 +350,31 @@ impl Renderer {
 
 // ── WGSL shader ───────────────────────────────────────────────────────────────
 
-// Make HOP_SIZE visible so renderer can use it without a circular dependency.
-pub use opendeck_analysis::waveform::HOP_SIZE;
-
 const WAVEFORM_WGSL: &str = r#"
 // Waveform display shader.
 //
-// Renders a frequency-colored bar-chart waveform.
-// The waveform texture is 1 pixel tall; each texel is [R,G,B,Amp].
-// R = bass, G = mid, B = high, A = overall amplitude (bar height).
-//
-// The bar extends from the vertical center up and down, scaled by amplitude.
-// A white hairline at the horizontal center marks the playhead.
+// Waveform data is a storage buffer of u32 values, one per column.
+// Each u32 packs [R, G, B, Amp] as little-endian bytes:
+//   bits  0-7:  R (bass energy)
+//   bits  8-15: G (mid energy)
+//   bits 16-23: B (high energy)
+//   bits 24-31: A (overall amplitude, controls bar height)
 
 struct Params {
     playhead_col: f32,   // column index at screen center
     cols_visible:  f32,  // columns visible across full width
-    num_cols:     f32,   // number of valid columns
-    tex_width:    f32,   // texture width (may be padded > num_cols)
+    num_cols:     f32,   // number of valid columns in the buffer
     screen_w:     f32,
     screen_h:     f32,
-    _pad:         vec2<f32>,
+    _pad0:        f32,
+    _pad1:        f32,
+    _pad2:        f32,
 };
 
-@group(0) @binding(0) var waveform_tex: texture_2d<f32>;
-@group(0) @binding(1) var waveform_smp: sampler;
-@group(0) @binding(2) var<uniform> p: Params;
+@group(0) @binding(0) var<storage, read> waveform: array<u32>;
+@group(0) @binding(1) var<uniform> p: Params;
 
-// ── Vertex: fullscreen triangle (no vertex buffer) ────────────────────────────
-// Three vertices covering the entire clip space.  Only the lower-left triangle
-// of the clip quad is drawn, which is sufficient for a fullscreen pass.
+// ── Vertex: fullscreen triangle ───────────────────────────────────────────────
 @vertex
 fn vs_main(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {
     let x = f32(vi & 1u) * 4.0 - 1.0;
@@ -438,40 +385,35 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {
 // ── Fragment ──────────────────────────────────────────────────────────────────
 @fragment
 fn fs_main(@builtin(position) frag_pos: vec4<f32>) -> @location(0) vec4<f32> {
-    // Screen UV: x in [0,1] left→right, y in [0,1] top→bottom.
     let sx = frag_pos.x / p.screen_w;
     let sy = frag_pos.y / p.screen_h;
 
-    // White playhead hairline at x = 0.5 (centre of screen).
+    // White playhead hairline at x = 0.5.
     if abs(frag_pos.x - p.screen_w * 0.5) < 1.5 {
         return vec4<f32>(1.0, 1.0, 1.0, 1.0);
     }
 
     // Map screen x → column index.
     let half  = p.cols_visible * 0.5;
-    let left  = p.playhead_col - half;
-    let col_f = left + sx * p.cols_visible;
+    let col_f = (p.playhead_col - half) + sx * p.cols_visible;
 
-    // Out of track range → dark.
+    // Out of track range → dark background.
     if col_f < 0.0 || col_f >= p.num_cols {
         return vec4<f32>(0.04, 0.04, 0.04, 1.0);
     }
 
-    // Sample the waveform texture.
-    let tex_u  = col_f / p.tex_width;
-    let sample = textureSample(waveform_tex, waveform_smp, vec2<f32>(tex_u, 0.5));
+    // Read packed waveform column from the storage buffer.
+    let col_idx = u32(col_f);
+    let packed  = waveform[col_idx];
+    let r   = f32( packed        & 0xFFu) / 255.0;
+    let g   = f32((packed >>  8u) & 0xFFu) / 255.0;
+    let b   = f32((packed >> 16u) & 0xFFu) / 255.0;
+    let amp = f32((packed >> 24u) & 0xFFu) / 255.0;
 
-    let r   = sample.r;
-    let g   = sample.g;
-    let b   = sample.b;
-    let amp = sample.a;   // 0–1 bar height
-
-    // Bar chart: filled within amplitude, dark outside.
-    // dist_from_centre: 0 at middle of screen, 1 at top/bottom edges.
+    // Bar chart centered vertically, height = amp.
     let dist = abs(sy - 0.5) * 2.0;
 
     if dist < amp {
-        // Slightly dim the colour toward the bar edges for a shaded look.
         let shade = 1.0 - dist / (amp + 0.001) * 0.3;
         return vec4<f32>(r * shade, g * shade, b * shade, 1.0);
     }

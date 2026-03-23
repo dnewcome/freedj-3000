@@ -5,7 +5,7 @@
 //! tracks how many samples have been consumed — shared with the renderer for
 //! waveform scrolling.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use opendeck_decode::SymphoniaDecoder;
 use opendeck_types::Decoder;
