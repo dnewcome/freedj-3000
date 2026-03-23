@@ -74,6 +74,7 @@ impl DeckApp {
 
         let pos       = self.audio.position.load(Ordering::Relaxed);
         let playing   = self.audio.playing.load(Ordering::Relaxed);
+        let speed     = self.audio.speed_load();
         let sr        = self.audio.sample_rate;
         let ch        = self.audio.channels as u64;
         let total_s   = self.audio.samples.len() as f64 / sr as f64 / ch as f64;
@@ -126,8 +127,19 @@ impl DeckApp {
                             );
                         }
                         ui.separator();
+                        let speed_color = if (speed - 1.0).abs() < 0.01 {
+                            egui::Color32::DARK_GRAY
+                        } else {
+                            egui::Color32::from_rgb(240, 160, 60)
+                        };
                         ui.label(
-                            egui::RichText::new("Space=play/pause  ←/→=seek  Q=quit")
+                            egui::RichText::new(format!("{:.2}×", speed))
+                                .color(speed_color)
+                                .monospace(),
+                        );
+                        ui.separator();
+                        ui.label(
+                            egui::RichText::new("Space=play/pause  ←/→=seek  +/-=speed  Q=quit")
                                 .color(egui::Color32::DARK_GRAY)
                                 .small(),
                         );
@@ -232,6 +244,20 @@ impl ApplicationHandler for DeckApp {
                         Ordering::Relaxed,
                     );
                 }
+                PhysicalKey::Code(KeyCode::Equal) | PhysicalKey::Code(KeyCode::NumpadAdd) => {
+                    let s = (self.audio.speed_load() + 0.05).min(2.0);
+                    self.audio.speed_store(s);
+                    log::info!("speed → {s:.2}×");
+                }
+                PhysicalKey::Code(KeyCode::Minus) | PhysicalKey::Code(KeyCode::NumpadSubtract) => {
+                    let s = (self.audio.speed_load() - 0.05).max(0.25);
+                    self.audio.speed_store(s);
+                    log::info!("speed → {s:.2}×");
+                }
+                PhysicalKey::Code(KeyCode::Digit0) | PhysicalKey::Code(KeyCode::Numpad0) => {
+                    self.audio.speed_store(1.0);
+                    log::info!("speed → 1.00× (reset)");
+                }
                 PhysicalKey::Code(KeyCode::Escape) | PhysicalKey::Code(KeyCode::KeyQ) => {
                     event_loop.exit();
                 }
@@ -301,6 +327,7 @@ fn main() -> Result<()> {
     let _midi = midi::MidiHandle::connect(
         Arc::clone(&audio.playing),
         Arc::clone(&audio.position),
+        Arc::clone(&audio.speed),
         audio.sample_rate,
         audio.channels,
         audio.samples.len(),

@@ -10,7 +10,7 @@
 use hidapi::HidApi;
 use std::{
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         Arc,
     },
     thread,
@@ -49,7 +49,8 @@ impl MidiHandle {
     pub fn connect(
         playing:     Arc<AtomicBool>,
         position:    Arc<AtomicU64>,
-        sample_rate:  u32,
+        speed:       Arc<AtomicU32>,
+        sample_rate: u32,
         channels:    u8,
         samples_len: usize,
     ) -> Option<Self> {
@@ -67,7 +68,7 @@ impl MidiHandle {
 
         let t = thread::Builder::new()
             .name("s2-hid".into())
-            .spawn(move || run_loop(playing, position, seek_delta, max_pos))
+            .spawn(move || run_loop(playing, position, speed, seek_delta, max_pos))
             .expect("failed to spawn S2 thread");
 
         Some(MidiHandle { _thread: t })
@@ -77,9 +78,11 @@ impl MidiHandle {
 fn run_loop(
     playing:    Arc<AtomicBool>,
     position:   Arc<AtomicU64>,
+    speed:      Arc<AtomicU32>,
     seek_delta: u64,
     max_pos:    u64,
 ) {
+    let _ = speed; // placeholder until pitch fader bytes are mapped
     let api = match HidApi::new() {
         Ok(a)  => a,
         Err(e) => { log::error!("HID: {e}"); return; }

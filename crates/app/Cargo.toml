@@ -10,9 +10,10 @@ name = "opendeck"
 path = "src/main.rs"
 
 [dependencies]
-opendeck-types    = { workspace = true }
-opendeck-decode   = { workspace = true }
-opendeck-analysis = { workspace = true }
+opendeck-types       = { workspace = true }
+opendeck-decode      = { workspace = true }
+opendeck-analysis    = { workspace = true }
+opendeck-timestretch = { workspace = true }
 cpal              = { workspace = true }
 rtrb              = { workspace = true }
 wgpu              = { workspace = true }
