@@ -112,9 +112,10 @@ fn run_loop(
     let mut touched      = false;
     // Calibrated on first HID report — start app with fader at center detent.
     let mut pitch_center: Option<u8> = None;
-    // The "true" speed set by the pitch fader; nudge offsets from this and
-    // snaps back when the jog comes to rest.
-    let mut base_speed: f32 = 1.0;
+    // Last stable fader position as a raw byte (integer — no float representation
+    // error).  Speed is always recomputed from this on snap-back so the result
+    // is bit-identical every time regardless of intermediate float rounding.
+    let mut fader_raw: u8 = 0;
     // Timestamp of the last nudge movement; snap-back fires after NUDGE_RELEASE_MS.
     let mut last_nudge: Option<Instant> = None;
 
@@ -177,17 +178,19 @@ fn run_loop(
                         // No touch + spinning: nudge.
                         // offset = delta * k so constant velocity → constant pitch %.
                         // Faster spin → larger delta → proportionally larger offset.
+                        let base = raw_to_speed(fader_raw, pitch_center.unwrap_or(fader_raw));
                         let offset = delta as f32 * NUDGE_SPEED_PER_COUNT;
-                        speed.store((base_speed + offset).clamp(0.25, 4.0).to_bits(), Ordering::Relaxed);
+                        speed.store((base + offset).clamp(0.25, 4.0).to_bits(), Ordering::Relaxed);
                         last_nudge = Some(Instant::now());
                     }
                 } else if !touched {
                     // Jog at rest: snap back after the idle window expires.
-                    // Using a time threshold avoids false snap-backs on slow spins
-                    // where individual reports can have delta == 0 between ticks.
+                    // Recompute from the integer fader_raw — same inputs always
+                    // produce the same f32, so snap-back is bit-exact every time.
                     let idle = last_nudge.map_or(true, |t| t.elapsed() > Duration::from_millis(NUDGE_RELEASE_MS as u64));
                     if idle {
-                        speed.store(base_speed.to_bits(), Ordering::Relaxed);
+                        let snap = raw_to_speed(fader_raw, pitch_center.unwrap_or(fader_raw));
+                        speed.store(snap.to_bits(), Ordering::Relaxed);
                         last_nudge = None;
                     }
                 }
@@ -200,22 +203,18 @@ fn run_loop(
             let raw = report[PITCH_FADER_BYTE];
             match pitch_center {
                 None => {
-                    // First report: latch center, set base_speed = 1.0.
+                    // First report: latch center = current fader position (1.0×).
                     pitch_center = Some(raw);
+                    fader_raw    = raw;
                     log::info!("S2 pitch fader: center calibrated at 0x{raw:02X}");
-                    base_speed = 1.0;
                     speed.store(1.0f32.to_bits(), Ordering::Relaxed);
                 }
                 Some(center) => {
-                    // Only update if moved by >1 count; filters single-count ADC
-                    // jitter which would otherwise corrupt base_speed and cause
-                    // snap-back to land at a slightly wrong value.
+                    // Dead zone: ignore ≤1-count moves to filter ADC jitter.
                     let prev = prev_btns[PITCH_FADER_BYTE];
                     if (raw as i32 - prev as i32).abs() > 1 {
-                        let offset     = center as f32 - raw as f32;
-                        let half_range = center.max(1) as f32;
-                        let new_speed  = (1.0 + offset / half_range * PITCH_FADER_RANGE).clamp(0.25, 4.0);
-                        base_speed = new_speed;
+                        fader_raw = raw;
+                        let new_speed = raw_to_speed(raw, center);
                         speed.store(new_speed.to_bits(), Ordering::Relaxed);
                         log::debug!("S2 pitch fader: 0x{raw:02X} (center 0x{center:02X}) → {new_speed:.3}×");
                     }
@@ -247,6 +246,15 @@ fn run_loop(
 
         prev_btns[..n].copy_from_slice(report);
     }
+}
+
+/// Convert a raw fader byte to a speed multiplier.
+/// Pure function of integer inputs — same raw + center always produces the
+/// same f32 bits, so snap-back is always bit-exact.
+fn raw_to_speed(raw: u8, center: u8) -> f32 {
+    let offset     = center as f32 - raw as f32;
+    let half_range = center.max(1) as f32;
+    (1.0 + offset / half_range * PITCH_FADER_RANGE).clamp(0.25, 4.0)
 }
 
 /// Fires `f` on the rising edge of a button bit (0→1 transition only).
