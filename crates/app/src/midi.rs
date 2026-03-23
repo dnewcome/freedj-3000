@@ -20,8 +20,6 @@ const VID: u16 = 0x17CC;
 const PID: u16 = 0x1320;
 
 // ── Button mappings — (byte_index, bitmask) ───────────────────────────────────
-// Fill these in after running with RUST_LOG=opendeck::midi=debug and pressing
-// each button. Look for "S2 byte[N] changed" lines in the log.
 
 const MAP_PLAY:     (usize, u8) = (11, 0x01);
 const MAP_CUE:      (usize, u8) = (11, 0x02);
@@ -29,14 +27,23 @@ const MAP_TOUCH:    (usize, u8) = (10, 0x01); // platter top touch sensor
 const MAP_SEEK_FWD: (usize, u8) = (0xFF, 0xFF);
 const MAP_SEEK_REV: (usize, u8) = (0xFF, 0xFF);
 
+// ── Pitch fader — byte 7, absolute 8-bit ─────────────────────────────────────
+// Observed range: 0x09 (fastest / full positive) → 0x32 (slowest / full negative).
+// Higher value = fader pushed down = slower speed.  Lower = fader up = faster.
+// Center (0% pitch) is estimated at 0x40; adjust if the detent doesn't land on 1.0×.
+
+const PITCH_FADER_BYTE:   usize = 7;
+/// Raw byte value that corresponds to 1.0× (fader at center detent).
+const PITCH_FADER_CENTER: u8   = 0x40;
+/// ±% pitch range — 0.08 = ±8% (CDJ-3000 default).  Max = 0.50 (±50%).
+const PITCH_FADER_RANGE:  f32  = 0.08;
+
 // ── Jog wheel sensitivity ─────────────────────────────────────────────────────
 // The 24-bit counter spans ~16.7M counts per full revolution.
-// This divisor controls how many audio samples move per count.
-// Higher = coarser scrub, lower = finer.  Tune to taste.
-/// Scrub (platter top touched): direct position control.  ~3s per revolution.
+
+/// Scrub (platter top touched): direct position control.  ~3 s per revolution.
 const SCRUB_SAMPLES_PER_COUNT: f64 = 0.025;
-/// Nudge (platter edge, no touch): light push, ~0.3s per revolution.
-/// TODO: replace with real pitch-bend when speed control is wired up.
+/// Nudge (platter edge, no touch): light push, ~0.3 s per revolution.
 const NUDGE_SAMPLES_PER_COUNT: f64 = 0.003;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -82,7 +89,6 @@ fn run_loop(
     seek_delta: u64,
     max_pos:    u64,
 ) {
-    let _ = speed; // placeholder until pitch fader bytes are mapped
     let api = match HidApi::new() {
         Ok(a)  => a,
         Err(e) => { log::error!("HID: {e}"); return; }
@@ -92,7 +98,7 @@ fn run_loop(
         Err(e) => { log::error!("HID: failed to open S2: {e}"); return; }
     };
 
-    log::info!("HID: S2 connected — jog wheel active");
+    log::info!("HID: S2 connected — jog wheel + pitch fader active");
 
     let mut prev_report = [0u8; 64];
     let mut buf         = [0u8; 64];
@@ -161,6 +167,17 @@ fn run_loop(
                 }
             }
             prev_jog = Some(jog);
+        }
+
+        // ── Pitch fader — byte 7, absolute ────────────────────────────────────
+        if PITCH_FADER_BYTE < n && report[PITCH_FADER_BYTE] != prev_btns[PITCH_FADER_BYTE] {
+            let raw    = report[PITCH_FADER_BYTE];
+            // Offset from center: positive = fader up = faster.
+            let offset = PITCH_FADER_CENTER as f32 - raw as f32;
+            let new_speed = (1.0 + offset / PITCH_FADER_CENTER as f32 * PITCH_FADER_RANGE)
+                .clamp(0.25, 4.0);
+            speed.store(new_speed.to_bits(), Ordering::Relaxed);
+            log::debug!("S2 pitch fader: 0x{raw:02X} → {new_speed:.3}×");
         }
 
         // ── Buttons ───────────────────────────────────────────────────────────
