@@ -29,15 +29,13 @@ const MAP_SEEK_FWD:      (usize, u8) = (0xFF, 0xFF);
 const MAP_SEEK_REV:      (usize, u8) = (0xFF, 0xFF);
 
 // ── Pitch fader — byte 7, absolute 8-bit ─────────────────────────────────────
-// Observed range: 0x09 (fastest / full positive) → 0x32 (slowest / full negative).
-// Higher value = fader pushed down = slower speed.  Lower = fader up = faster.
-// Center (0% pitch) is estimated at 0x40; adjust if the detent doesn't land on 1.0×.
+// Higher value = fader pushed down = slower.  Lower = fader up = faster.
+// Center is calibrated from the fader position in the first HID report —
+// start the app with the fader at its center detent.
 
-const PITCH_FADER_BYTE:   usize = 7;
-/// Raw byte value that corresponds to 1.0× (fader at center detent).
-const PITCH_FADER_CENTER: u8   = 0x40;
+const PITCH_FADER_BYTE:  usize = 7;
 /// ±% pitch range — 0.16 = ±16% (wide DJ range).  CDJ-3000 default is 0.08 (±8%).
-const PITCH_FADER_RANGE:  f32  = 0.16;
+const PITCH_FADER_RANGE: f32   = 0.16;
 
 // ── Jog wheel sensitivity ─────────────────────────────────────────────────────
 // The 24-bit counter spans ~16.7M counts per full revolution.
@@ -101,11 +99,13 @@ fn run_loop(
 
     log::info!("HID: S2 connected — jog wheel + pitch fader active");
 
-    let mut prev_report = [0u8; 64];
-    let mut buf         = [0u8; 64];
-    let mut prev_jog:   Option<u32> = None;
-    let mut prev_btns   = [0u8; 64];
-    let mut touched     = false;
+    let mut prev_report  = [0u8; 64];
+    let mut buf          = [0u8; 64];
+    let mut prev_jog:    Option<u32> = None;
+    let mut prev_btns    = [0u8; 64];
+    let mut touched      = false;
+    // Calibrated on first HID report — start app with fader at center detent.
+    let mut pitch_center: Option<u8> = None;
 
     loop {
         let n = match device.read_timeout(&mut buf, 100) {
@@ -168,14 +168,22 @@ fn run_loop(
         }
 
         // ── Pitch fader — byte 7, absolute ────────────────────────────────────
-        if PITCH_FADER_BYTE < n && report[PITCH_FADER_BYTE] != prev_btns[PITCH_FADER_BYTE] {
-            let raw    = report[PITCH_FADER_BYTE];
-            // Offset from center: positive = fader up = faster.
-            let offset = PITCH_FADER_CENTER as f32 - raw as f32;
-            let new_speed = (1.0 + offset / PITCH_FADER_CENTER as f32 * PITCH_FADER_RANGE)
-                .clamp(0.25, 4.0);
-            speed.store(new_speed.to_bits(), Ordering::Relaxed);
-            log::debug!("S2 pitch fader: 0x{raw:02X} → {new_speed:.3}×");
+        if PITCH_FADER_BYTE < n {
+            let raw = report[PITCH_FADER_BYTE];
+            // Latch center from the very first report (app must start with
+            // fader at the center detent).
+            let center = *pitch_center.get_or_insert_with(|| {
+                log::info!("S2 pitch fader: center calibrated at 0x{raw:02X}");
+                raw
+            });
+            if raw != prev_btns[PITCH_FADER_BYTE] {
+                // offset > 0 → fader above center → faster
+                let offset    = center as f32 - raw as f32;
+                let half_range = center.max(1) as f32;
+                let new_speed  = (1.0 + offset / half_range * PITCH_FADER_RANGE).clamp(0.25, 4.0);
+                speed.store(new_speed.to_bits(), Ordering::Relaxed);
+                log::debug!("S2 pitch fader: 0x{raw:02X} (center 0x{center:02X}) → {new_speed:.3}×");
+            }
         }
 
         // ── Buttons ───────────────────────────────────────────────────────────
