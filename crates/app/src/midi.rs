@@ -23,8 +23,8 @@ const PID: u16 = 0x1320;
 
 const MAP_PLAY:          (usize, u8) = (11, 0x01);
 const MAP_CUE:           (usize, u8) = (11, 0x02);
-const MAP_PLATTER_TOUCH: (usize, u8) = (10, 0x01); // capacitive — hand resting on platter
-const MAP_PLATTER_PRESS: (usize, u8) = (0xFF, 0xFF); // TODO: discover physical press-down byte
+// byte[10] bit 0x01 — capacitive touch only; S2 MK2 has no separate press sensor.
+const MAP_PLATTER_TOUCH: (usize, u8) = (10, 0x01);
 const MAP_SEEK_FWD:      (usize, u8) = (0xFF, 0xFF);
 const MAP_SEEK_REV:      (usize, u8) = (0xFF, 0xFF);
 
@@ -106,7 +106,6 @@ fn run_loop(
     let mut prev_jog:   Option<u32> = None;
     let mut prev_btns   = [0u8; 64];
     let mut touched     = false;
-    let mut pressed     = false;
 
     loop {
         let n = match device.read_timeout(&mut buf, 100) {
@@ -126,21 +125,13 @@ fn run_loop(
         }
         prev_report[..n].copy_from_slice(report);
 
-        // ── Platter touch & press sensors ─────────────────────────────────────
+        // ── Platter touch sensor ──────────────────────────────────────────────
         let (t_byte, t_mask) = MAP_PLATTER_TOUCH;
         if t_byte < n {
             let now = (report[t_byte] & t_mask) != 0;
             if now != touched {
                 touched = now;
-                log::debug!("S2 platter {}", if touched { "touched" } else { "released" });
-            }
-        }
-        let (p_byte, p_mask) = MAP_PLATTER_PRESS;
-        if p_byte < n {
-            let now = (report[p_byte] & p_mask) != 0;
-            if now != pressed {
-                pressed = now;
-                log::debug!("S2 platter {}", if pressed { "pressed (scrub)" } else { "released (nudge)" });
+                log::debug!("S2 platter {}", if touched { "touched (scrub)" } else { "released" });
             }
         }
 
@@ -161,26 +152,16 @@ fn run_loop(
                     raw_delta
                 };
 
-                if delta != 0 {
-                    if pressed {
-                        // Physical press: scrub — moves the playhead directly.
-                        let samples = (delta.abs() as f64 * SCRUB_SAMPLES_PER_COUNT) as u64;
-                        let pos = position.load(Ordering::Relaxed);
-                        if delta > 0 {
-                            position.store(pos.saturating_add(samples).min(max_pos), Ordering::Relaxed);
-                        } else {
-                            position.store(pos.saturating_sub(samples), Ordering::Relaxed);
-                        }
-                    } else if touched {
-                        // Capacitive touch only: nudge — temporary pitch bend via speed.
-                        // TODO: implement as a proper transient speed offset rather than
-                        // a permanent store, once the engine supports it.
-                        let nudge = delta as f64 * NUDGE_SAMPLES_PER_COUNT;
-                        let current = f32::from_bits(speed.load(Ordering::Relaxed));
-                        let nudged = (current + nudge as f32 * 0.001).clamp(0.25, 4.0);
-                        speed.store(nudged.to_bits(), Ordering::Relaxed);
+                if delta != 0 && touched {
+                    // Touch active: scrub — directly moves the playhead.
+                    // No touch: platter spins freely with no effect.
+                    let samples = (delta.abs() as f64 * SCRUB_SAMPLES_PER_COUNT) as u64;
+                    let pos = position.load(Ordering::Relaxed);
+                    if delta > 0 {
+                        position.store(pos.saturating_add(samples).min(max_pos), Ordering::Relaxed);
+                    } else {
+                        position.store(pos.saturating_sub(samples), Ordering::Relaxed);
                     }
-                    // No contact: jog spins freely, no effect.
                 }
             }
             prev_jog = Some(jog);
