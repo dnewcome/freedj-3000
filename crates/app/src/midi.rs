@@ -14,6 +14,7 @@ use std::{
         Arc,
     },
     thread,
+    time::{Duration, Instant},
 };
 
 const VID: u16 = 0x17CC;
@@ -42,9 +43,12 @@ const PITCH_FADER_RANGE: f32   = 0.16;
 
 /// Scrub (platter top touched): direct position control.  ~3 s per revolution.
 const SCRUB_SAMPLES_PER_COUNT: f64 = 0.025;
-/// Nudge (platter edge, no touch): speed offset per jog count.
-/// At a moderate spin (~500 counts/s) this gives roughly ±2% speed change.
-const NUDGE_SPEED_PER_COUNT: f32 = 0.00005;
+/// Nudge (platter edge, no touch): speed offset per jog count per 100 ms poll.
+/// Tune so a slow steady spin gives ~1% offset.
+const NUDGE_SPEED_PER_COUNT: f32 = 0.0001;
+
+/// How long the jog must be idle before speed snaps back to the pitch fader value.
+const NUDGE_RELEASE_MS: u128 = 150;
 
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -110,6 +114,8 @@ fn run_loop(
     // The "true" speed set by the pitch fader; nudge offsets from this and
     // snaps back when the jog comes to rest.
     let mut base_speed: f32 = 1.0;
+    // Timestamp of the last nudge movement; snap-back fires after NUDGE_RELEASE_MS.
+    let mut last_nudge: Option<Instant> = None;
 
     loop {
         let n = match device.read_timeout(&mut buf, 100) {
@@ -167,15 +173,22 @@ fn run_loop(
                             position.store(pos.saturating_sub(samples), Ordering::Relaxed);
                         }
                     } else {
-                        // No touch: nudge — temporary speed offset, visible in UI.
-                        // Positive delta (forward spin) = speed up; negative = slow down.
+                        // No touch + spinning: nudge.
+                        // offset = delta * k so constant velocity → constant pitch %.
+                        // Faster spin → larger delta → proportionally larger offset.
                         let offset = delta as f32 * NUDGE_SPEED_PER_COUNT;
-                        let nudged = (base_speed + offset).clamp(0.25, 4.0);
-                        speed.store(nudged.to_bits(), Ordering::Relaxed);
+                        speed.store((base_speed + offset).clamp(0.25, 4.0).to_bits(), Ordering::Relaxed);
+                        last_nudge = Some(Instant::now());
                     }
                 } else if !touched {
-                    // Jog at rest and not touching: snap back to pitch fader base speed.
-                    speed.store(base_speed.to_bits(), Ordering::Relaxed);
+                    // Jog at rest: snap back after the idle window expires.
+                    // Using a time threshold avoids false snap-backs on slow spins
+                    // where individual reports can have delta == 0 between ticks.
+                    let idle = last_nudge.map_or(true, |t| t.elapsed() > Duration::from_millis(NUDGE_RELEASE_MS as u64));
+                    if idle {
+                        speed.store(base_speed.to_bits(), Ordering::Relaxed);
+                        last_nudge = None;
+                    }
                 }
             }
             prev_jog = Some(jog);
