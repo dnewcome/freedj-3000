@@ -39,17 +39,18 @@ use std::{
 const BLOCK_FRAMES: usize = 512;
 
 /// Ring buffer capacity in device samples (not frames).
-/// 2 seconds at 48kHz stereo ≈ 192 000.
-const RING_BUFFER_SAMPLES: usize = 200_000;
-
-/// Back-pressure threshold: minimum free slots in the ring buffer before
-/// we'll process another block.
 ///
-/// At 0.25× speed RubberBand outputs 4× the input frames, so we need room
-/// for up to BLOCK_FRAMES × 4 output frames × device channels.  8× gives
-/// comfortable headroom.  With a 200 K sample ring buffer this is never
-/// close to full during normal use.
-const BACK_PRESSURE_SLOTS: usize = BLOCK_FRAMES * 8 * 2; // 2 = max device channels
+/// Keep this small so speed changes are heard immediately.  At 44.1kHz stereo
+/// 8 192 samples ≈ 93 ms — large enough to absorb thread-scheduling jitter,
+/// small enough that the pitch fader response feels instant.
+const RING_BUFFER_SAMPLES: usize = 8_192;
+
+/// Minimum free slots required before processing another block.
+///
+/// At the minimum supported speed (0.25×) RubberBand outputs 4× input frames:
+///   BLOCK_FRAMES / 0.25 × device_ch = 512 × 4 × 2 = 4 096 samples worst case.
+/// Must be < RING_BUFFER_SAMPLES so back-pressure never permanently stalls.
+const BACK_PRESSURE_SLOTS: usize = BLOCK_FRAMES * 4 * 2; // = 4 096
 
 /// If position jumps by more than this many source samples the processor
 /// treats it as a seek and resets the timestretch engine.
