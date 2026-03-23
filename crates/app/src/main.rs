@@ -8,6 +8,7 @@
 //!   Esc / Q  — quit
 
 mod audio;
+mod midi;
 mod renderer;
 
 use anyhow::{bail, Context, Result};
@@ -270,7 +271,16 @@ fn main() -> Result<()> {
         t0.elapsed().as_secs_f32()
     );
 
-    // ── 3. Run the UI event loop ──────────────────────────────────────────────
+    // ── 3. Connect MIDI controller (optional — app runs fine without it) ─────────
+    let _midi = midi::MidiHandle::connect(
+        Arc::clone(&audio.playing),
+        Arc::clone(&audio.position),
+        audio.sample_rate,
+        audio.channels,
+        audio.samples.len(),
+    );
+
+    // ── 4. Run the UI event loop ──────────────────────────────────────────────
     let event_loop = EventLoop::new().context("failed to create event loop")?;
     event_loop.set_control_flow(ControlFlow::Poll);
 

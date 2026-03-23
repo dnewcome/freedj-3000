@@ -25,3 +25,5 @@ pollster          = "0.3"
 log               = { workspace = true }
 env_logger        = { workspace = true }
 anyhow            = { workspace = true }
+midir             = { workspace = true }
+hidapi            = { workspace = true }

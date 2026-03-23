@@ -1,0 +1,199 @@
+//! Traktor Kontrol S2 MK2 input — raw USB HID.
+//!
+//! The S2 MK2 reports absolute jog position as a 24-bit counter across
+//! bytes [1, 2, 3] of each HID report (byte 3 = MSB, byte 1 = LSB).
+//! We compute the signed delta between frames and map it to playhead movement.
+//!
+//! Run with RUST_LOG=opendeck::midi=debug to see all byte changes when
+//! you press buttons you want to map.
+
+use hidapi::HidApi;
+use std::{
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc,
+    },
+    thread,
+};
+
+const VID: u16 = 0x17CC;
+const PID: u16 = 0x1320;
+
+// ── Button mappings — (byte_index, bitmask) ───────────────────────────────────
+// Fill these in after running with RUST_LOG=opendeck::midi=debug and pressing
+// each button. Look for "S2 byte[N] changed" lines in the log.
+
+const MAP_PLAY:     (usize, u8) = (11, 0x01);
+const MAP_CUE:      (usize, u8) = (11, 0x02);
+const MAP_TOUCH:    (usize, u8) = (10, 0x01); // platter top touch sensor
+const MAP_SEEK_FWD: (usize, u8) = (0xFF, 0xFF);
+const MAP_SEEK_REV: (usize, u8) = (0xFF, 0xFF);
+
+// ── Jog wheel sensitivity ─────────────────────────────────────────────────────
+// The 24-bit counter spans ~16.7M counts per full revolution.
+// This divisor controls how many audio samples move per count.
+// Higher = coarser scrub, lower = finer.  Tune to taste.
+/// Scrub (platter top touched): direct position control.  ~3s per revolution.
+const SCRUB_SAMPLES_PER_COUNT: f64 = 0.025;
+/// Nudge (platter edge, no touch): light push, ~0.3s per revolution.
+/// TODO: replace with real pitch-bend when speed control is wired up.
+const NUDGE_SAMPLES_PER_COUNT: f64 = 0.003;
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub struct MidiHandle {
+    _thread: thread::JoinHandle<()>,
+}
+
+impl MidiHandle {
+    pub fn connect(
+        playing:     Arc<AtomicBool>,
+        position:    Arc<AtomicU64>,
+        sample_rate:  u32,
+        channels:    u8,
+        samples_len: usize,
+    ) -> Option<Self> {
+        let api = HidApi::new().map_err(|e| log::warn!("HID: init failed: {e}")).ok()?;
+
+        if api.device_list().find(|d| d.vendor_id() == VID && d.product_id() == PID).is_none() {
+            log::info!("HID: Traktor Kontrol S2 MK2 not found");
+            return None;
+        }
+
+        log::info!("HID: found Traktor Kontrol S2 MK2 — spawning input thread");
+
+        let seek_delta = sample_rate as u64 * channels as u64 * 4;
+        let max_pos    = samples_len as u64;
+
+        let t = thread::Builder::new()
+            .name("s2-hid".into())
+            .spawn(move || run_loop(playing, position, seek_delta, max_pos))
+            .expect("failed to spawn S2 thread");
+
+        Some(MidiHandle { _thread: t })
+    }
+}
+
+fn run_loop(
+    playing:    Arc<AtomicBool>,
+    position:   Arc<AtomicU64>,
+    seek_delta: u64,
+    max_pos:    u64,
+) {
+    let api = match HidApi::new() {
+        Ok(a)  => a,
+        Err(e) => { log::error!("HID: {e}"); return; }
+    };
+    let device = match api.open(VID, PID) {
+        Ok(d)  => d,
+        Err(e) => { log::error!("HID: failed to open S2: {e}"); return; }
+    };
+
+    log::info!("HID: S2 connected — jog wheel active");
+
+    let mut prev_report = [0u8; 64];
+    let mut buf         = [0u8; 64];
+    let mut prev_jog:   Option<u32> = None;
+    let mut prev_btns   = [0u8; 64];
+    let mut touched     = false;
+
+    loop {
+        let n = match device.read_timeout(&mut buf, 100) {
+            Ok(n)  => n,
+            Err(e) => { log::error!("HID read: {e}"); break; }
+        };
+        if n == 0 { continue; }
+
+        let report = &buf[..n];
+
+        // ── Discovery logging ─────────────────────────────────────────────────
+        for i in 0..n {
+            if report[i] != prev_report[i] {
+                log::debug!("S2 byte[{i:02}] changed: 0x{:02X} → 0x{:02X}",
+                    prev_report[i], report[i]);
+            }
+        }
+        prev_report[..n].copy_from_slice(report);
+
+        // ── Touch sensor ──────────────────────────────────────────────────────
+        let (t_byte, t_mask) = MAP_TOUCH;
+        if t_byte < n {
+            let now_touched = (report[t_byte] & t_mask) != 0;
+            if now_touched != touched {
+                touched = now_touched;
+                log::debug!("S2 platter {}", if touched { "touched (scrub)" } else { "released (nudge)" });
+            }
+        }
+
+        // ── Jog wheel — 24-bit absolute counter (byte3=MSB, byte1=LSB) ────────
+        if n >= 4 {
+            let jog = (report[3] as u32) << 16
+                    | (report[2] as u32) << 8
+                    | (report[1] as u32);
+
+            if let Some(prev) = prev_jog {
+                // Signed 24-bit delta with wraparound handling.
+                let raw_delta = jog.wrapping_sub(prev) as i32;
+                let delta = if raw_delta > 0x7FFFFF {
+                    raw_delta - 0x1000000
+                } else if raw_delta < -0x7FFFFF {
+                    raw_delta + 0x1000000
+                } else {
+                    raw_delta
+                };
+
+                if delta != 0 {
+                    let sensitivity = if touched {
+                        SCRUB_SAMPLES_PER_COUNT
+                    } else {
+                        NUDGE_SAMPLES_PER_COUNT
+                    };
+                    let samples = (delta.abs() as f64 * sensitivity) as u64;
+                    let pos = position.load(Ordering::Relaxed);
+                    if delta > 0 {
+                        position.store(pos.saturating_add(samples).min(max_pos), Ordering::Relaxed);
+                    } else {
+                        position.store(pos.saturating_sub(samples), Ordering::Relaxed);
+                    }
+                }
+            }
+            prev_jog = Some(jog);
+        }
+
+        // ── Buttons ───────────────────────────────────────────────────────────
+        btn_edge(report, &prev_btns, MAP_PLAY, || {
+            let was = playing.load(Ordering::Relaxed);
+            playing.store(!was, Ordering::Relaxed);
+            log::info!("S2 → {}", if was { "paused" } else { "playing" });
+        });
+
+        btn_edge(report, &prev_btns, MAP_CUE, || {
+            position.store(0, Ordering::Relaxed);
+            log::info!("S2 → cue");
+        });
+
+        btn_edge(report, &prev_btns, MAP_SEEK_FWD, || {
+            let pos = position.load(Ordering::Relaxed);
+            position.store(pos.saturating_add(seek_delta).min(max_pos), Ordering::Relaxed);
+        });
+
+        btn_edge(report, &prev_btns, MAP_SEEK_REV, || {
+            let pos = position.load(Ordering::Relaxed);
+            position.store(pos.saturating_sub(seek_delta), Ordering::Relaxed);
+        });
+
+        prev_btns[..n].copy_from_slice(report);
+    }
+}
+
+/// Fires `f` on the rising edge of a button bit (0→1 transition only).
+fn btn_edge(report: &[u8], prev: &[u8], map: (usize, u8), f: impl FnOnce()) {
+    let (byte, mask) = map;
+    if byte == 0xFF { return; }
+    if byte >= report.len() || byte >= prev.len() { return; }
+    let now_set  = (report[byte] & mask) != 0;
+    let was_set  = (prev[byte]   & mask) != 0;
+    if now_set && !was_set {
+        f();
+    }
+}

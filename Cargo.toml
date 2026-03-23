@@ -38,6 +38,12 @@ opendeck-ui          = { path = "crates/ui" }
 # Audio I/O
 cpal        = { version = "0.15" }
 
+# MIDI I/O — for class-compliant controllers during development
+midir       = "0.10"
+
+# HID I/O — for Native Instruments controllers (Kontrol S2 etc.)
+hidapi      = "2"
+
 # Lock-free ring buffer — the only data structure in the RT audio path
 rtrb        = "0.3"
 

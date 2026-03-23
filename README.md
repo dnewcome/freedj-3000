@@ -86,6 +86,21 @@ cargo run --release -p opendeck-app -- /path/to/track.mp3
 | `←` / `→` | Seek ±10 seconds |
 | `Q` / `Esc` | Quit |
 
+### Controller input (development only)
+
+Until the custom hardware and RP2350 firmware exist, a **Traktor Kontrol S2 MK2** can be used as a temporary control surface. It is detected automatically over USB HID if plugged in before launch.
+
+| Control | Action |
+|---|---|
+| Platter (top, touched) | Scrub — directly moves the playhead |
+| Platter (edge, no touch) | Nudge — light push, much lower sensitivity |
+| Play button | Play / pause |
+| Cue button | Return to zero |
+
+The jog wheel sends a 24-bit absolute position counter. Touch state switches between scrub and nudge sensitivity. Sensitivity constants are at the top of `crates/app/src/midi.rs`.
+
+To discover mappings for additional buttons, run with `RUST_LOG=debug` and press them — every byte change in the HID report is logged. The S2 is not a long-term target; hardware controller support is TBD pending the physical design.
+
 ---
 
 ## Architecture
