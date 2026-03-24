@@ -142,36 +142,69 @@ impl BeatAnalyzer for BeatAnalyzerImpl {
 
 // ── DSP helpers ───────────────────────────────────────────────────────────────
 
-/// Compute an onset strength signal from mono PCM.
-/// Returns a downsampled vector (~86 values/sec at hop=512).
+/// Compute an onset strength signal from mono PCM using half-wave rectified
+/// spectral flux.  Operates on sub-bands so kick, snare, and hi-hat all
+/// contribute, making the result more robust than a single-band energy
+/// differentiator.  Returns ~86 values/sec at hop=512.
 fn onset_strength(samples: &[f32], sr: f32) -> Vec<f32> {
-    const HOP: usize = 512;
+    use rustfft::{num_complex::Complex, FftPlanner};
+
+    const HOP:    usize = 512;
     const WINDOW: usize = 1024;
 
-    // Simple bass bandpass via two one-pole IIR filters.
-    let lp_coeff = 1.0 - (-2.0 * std::f32::consts::PI * 400.0 / sr).exp();
-    let hp_coeff = 1.0 - (-2.0 * std::f32::consts::PI * 80.0 / sr).exp();
-
-    let mut lp = 0f32;
-    let mut hp_prev = 0f32;
-    let mut filtered = vec![0f32; samples.len()];
-
-    for (i, &s) in samples.iter().enumerate() {
-        lp += lp_coeff * (s - lp);
-        let hp = lp - hp_prev;
-        hp_prev = lp - hp_coeff * (lp - hp_prev);
-        filtered[i] = hp.max(0.0); // half-wave rectify
+    let n_hops = samples.len().saturating_sub(WINDOW) / HOP;
+    if n_hops == 0 {
+        return vec![];
     }
 
-    // Compute RMS energy per hop and differentiate.
-    let n_hops = samples.len() / HOP;
-    let mut onset = vec![0f32; n_hops];
-    let mut prev_energy = 0f32;
+    let mut planner = FftPlanner::<f32>::new();
+    let fft = planner.plan_fft_forward(WINDOW);
 
-    for (h, chunk) in filtered.chunks(HOP).enumerate().take(n_hops) {
-        let energy = (chunk.iter().map(|&x| x * x).sum::<f32>() / chunk.len() as f32).sqrt();
-        onset[h] = (energy - prev_energy).max(0.0);
-        prev_energy = energy;
+    // Hann window coefficients.
+    let hann: Vec<f32> = (0..WINDOW)
+        .map(|i| 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / (WINDOW - 1) as f32).cos()))
+        .collect();
+
+    let bin_hz  = sr / WINDOW as f32;
+    // Divide spectrum into three sub-bands: bass, mid, high.
+    let bass_end = (300.0  / bin_hz) as usize;
+    let mid_end  = (3000.0 / bin_hz) as usize;
+    let n_bins   = WINDOW / 2;
+
+    let mut onset     = vec![0f32; n_hops];
+    let mut prev_mag  = vec![0f32; n_bins];
+
+    for h in 0..n_hops {
+        let start = h * HOP;
+        let mut buf: Vec<Complex<f32>> = samples[start..start + WINDOW]
+            .iter()
+            .zip(hann.iter())
+            .map(|(&s, &w)| Complex::new(s * w, 0.0))
+            .collect();
+
+        fft.process(&mut buf);
+
+        let mag: Vec<f32> = buf[..n_bins]
+            .iter()
+            .map(|c| c.norm() / WINDOW as f32)
+            .collect();
+
+        // Half-wave rectified spectral flux, weighted by sub-band.
+        // Bass gets 3× weight so the kick drum dominates as expected.
+        let flux: f32 = mag.iter()
+            .zip(prev_mag.iter())
+            .enumerate()
+            .map(|(bin, (&m, &p))| {
+                let diff = (m - p).max(0.0);
+                let weight = if bin < bass_end { 3.0 }
+                             else if bin < mid_end { 1.0 }
+                             else { 0.5 };
+                diff * weight
+            })
+            .sum();
+
+        onset[h]  = flux;
+        prev_mag  = mag;
     }
 
     onset
@@ -195,15 +228,11 @@ fn estimate_bpm(onset: &[f32], sr: f32) -> (f32, f32) {
         return (120.0, 0.0);
     }
 
-    // Compute autocorrelation over BPM range.
     let mut best_lag = min_lag;
     let mut best_val = f32::NEG_INFINITY;
 
     for lag in min_lag..=max_lag {
-        let ac: f32 = onset.iter()
-            .zip(onset[lag..].iter())
-            .map(|(a, b)| a * b)
-            .sum();
+        let ac: f32 = onset.iter().zip(onset[lag..].iter()).map(|(a, b)| a * b).sum();
         if ac > best_val {
             best_val = ac;
             best_lag = lag;

@@ -111,7 +111,7 @@ impl Renderer {
             format,
             width:                        size.width.max(1),
             height:                       size.height.max(1),
-            present_mode:                 wgpu::PresentMode::Fifo,
+            present_mode:                 wgpu::PresentMode::AutoNoVsync,
             alpha_mode:                   caps.alpha_modes[0],
             view_formats:                 vec![],
             desired_maximum_frame_latency: 2,
@@ -438,13 +438,19 @@ fn fs_main(@builtin(position) frag_pos: vec4<f32>) -> @location(0) vec4<f32> {
         return vec4<f32>(0.04, 0.04, 0.04, 1.0);
     }
 
-    // Read packed waveform column from the storage buffer.
-    let col_idx = u32(col_f);
-    let packed  = waveform[col_idx];
-    let r   = f32( packed        & 0xFFu) / 255.0;
-    let g   = f32((packed >>  8u) & 0xFFu) / 255.0;
-    let b   = f32((packed >> 16u) & 0xFFu) / 255.0;
-    let amp = f32((packed >> 24u) & 0xFFu) / 255.0;
+    // Read packed waveform column — bilinear interpolation between adjacent
+    // columns so the waveform scrolls sub-pixel smoothly.
+    let col_lo  = u32(col_f);
+    let col_hi  = min(col_lo + 1u, u32(p.num_cols) - 1u);
+    let frac    = col_f - f32(col_lo);
+
+    let p0 = waveform[col_lo];
+    let p1 = waveform[col_hi];
+
+    let r   = mix(f32( p0        & 0xFFu) / 255.0, f32( p1        & 0xFFu) / 255.0, frac);
+    let g   = mix(f32((p0 >>  8u) & 0xFFu) / 255.0, f32((p1 >>  8u) & 0xFFu) / 255.0, frac);
+    let b   = mix(f32((p0 >> 16u) & 0xFFu) / 255.0, f32((p1 >> 16u) & 0xFFu) / 255.0, frac);
+    let amp = mix(f32((p0 >> 24u) & 0xFFu) / 255.0, f32((p1 >> 24u) & 0xFFu) / 255.0, frac);
 
     // Beat grid tick marks.
     // Downbeats: orange (CDJ-style), 2 columns wide.

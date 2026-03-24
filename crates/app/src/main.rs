@@ -120,8 +120,9 @@ impl DeckApp {
                             } else {
                                 egui::Color32::from_rgb(220, 180, 60)
                             };
+                            let displayed_bpm = grid.bpm * speed as f64;
                             ui.label(
-                                egui::RichText::new(format!("{:.1} BPM", grid.bpm))
+                                egui::RichText::new(format!("{:.1} BPM", displayed_bpm))
                                     .color(color)
                                     .monospace(),
                             );
@@ -272,13 +273,17 @@ impl ApplicationHandler for DeckApp {
 
             WindowEvent::RedrawRequested => {
                 self.render_frame();
-                // Request the next frame unconditionally (we are always animating).
-                if let Some(w) = &self.window {
-                    w.request_redraw();
-                }
             }
 
             _ => {}
+        }
+    }
+
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        // Drive continuous animation from outside the event handler so
+        // Wayland compositors get a consistent redraw cadence.
+        if let Some(w) = &self.window {
+            w.request_redraw();
         }
     }
 }
