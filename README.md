@@ -25,9 +25,11 @@ This project takes the position that DJ equipment protocols are infrastructure, 
 | MP3/FLAC/AAC/OGG decode | ✅ Working |
 | Waveform visualization | ✅ Working |
 | Play / pause / seek | ✅ Working |
-| Beat detection | 🔧 In progress |
-| ProDJ Link network sync | 🔧 In progress |
-| Serato/Traktor DVS timecode | 🔧 In progress |
+| Variable speed / pitch | ✅ Working |
+| Beat detection (MiniBPM) | ✅ Working |
+| Beat grid overlay | ✅ Working |
+| MIDI controller input | ✅ Working |
+| ProDJ Link beat sync (receive) | ✅ Working |
 | Cue points / loops | 📋 Planned |
 | Key lock / timestretching | 📋 Planned |
 | Hardware control surface | 📋 Planned |
@@ -88,18 +90,35 @@ cargo run --release -p opendeck-app -- /path/to/track.mp3
 
 ### Controller input (development only)
 
-Until the custom hardware and RP2350 firmware exist, a **Traktor Kontrol S2 MK2** can be used as a temporary control surface. It is detected automatically over USB HID if plugged in before launch.
+Until the custom hardware and RP2350 firmware exist, a **Numark DJ2Go** (or any class-compliant USB MIDI controller) can be used as a temporary control surface. It is detected automatically over USB MIDI if plugged in before launch.
 
 | Control | Action |
 |---|---|
-| Platter (top, touched) | Scrub — directly moves the playhead |
-| Platter (edge, no touch) | Nudge — light push, much lower sensitivity |
+| Jog wheel | Nudge playback speed (snaps back on release) |
+| Pitch fader | Set playback speed (±16%) |
+| Pitch +/− buttons | Step speed ±1% |
 | Play button | Play / pause |
 | Cue button | Return to zero |
 
-The jog wheel sends a 24-bit absolute position counter. Touch state switches between scrub and nudge sensitivity. Sensitivity constants are at the top of `crates/app/src/midi.rs`.
+Deck B controls drive the second beat grid (for ProDJ Link sync comparison):
 
-To discover mappings for additional buttons, run with `RUST_LOG=debug` and press them — every byte change in the HID report is logged. The S2 is not a long-term target; hardware controller support is TBD pending the physical design.
+| Control | Action |
+|---|---|
+| Jog wheel (ch 1) | Nudge B2 BPM |
+| Pitch fader (ch 1) | Set B2 BPM |
+| Cue button (ch 1) | Reset B2 beat phase |
+
+MIDI mappings are constants at the top of `crates/app/src/midi.rs`. To discover mappings for a different controller run with `RUST_LOG=debug` — every incoming MIDI message is logged.
+
+### ProDJ Link (receive-only)
+
+FreeDJ-3000 listens on UDP port 50002 for Pioneer beat packets. When a CDJ on the same network sends a beat, the second beat grid (cyan strip at the bottom of the waveform display) updates to show that deck's tempo and phase. Use this to manually beatmatch your track to an incoming CDJ.
+
+For single-machine testing without real hardware:
+
+```bash
+python3 tools/send_beat.py 130.0 127.0.0.1 50002
+```
 
 ---
 
@@ -114,7 +133,7 @@ crates/
   analysis/     — Waveform FFT, beat grid computation
   engine/       — Real-time audio transport (per-sample loop, slip mode, hot cues)
   timestretch/  — Key-lock (Rubber Band) and speed change (rubato resampler)
-  timecode/     — DVS vinyl timecode decoder (Serato, Traktor, Mixvibes, Pioneer)
+  timecode/     — DVS vinyl timecode decoder (stub; not a current priority)
   link/         — ProDJ Link network protocol (beat sync, track metadata broadcast)
   protocol/     — MCU serial protocol for the RP2350 control surface
   db/           — SQLite track library (beat grids, cue points, playlists, FTS5 search)
@@ -148,16 +167,17 @@ Each waveform column is a 2048-sample FFT window (Hann-windowed, HOP_SIZE=512) m
 
 The entire waveform for a 5-minute track is computed in ~0.1 seconds and stored as a GPU storage buffer, one `u32` per column.
 
+### Beat detection
+
+Beat analysis runs offline before playback starts. A 6-second analysis window is fed to [MiniBPM](https://github.com/breakfastquay/minibpm) for tempo estimation, followed by a half-wave-rectified spectral flux onset detector that finds the beat anchor by maximising onset energy at grid positions. The result is a `BeatGrid` with a confidence score, BPM, and anchor sample position.
+
+The beat grid is displayed as white tick marks on the waveform (red on downbeats). The displayed BPM scales with the current pitch-fader position so it always shows the effective playback tempo.
+
+The second beat grid (cyan strip, bottom 40 px) represents an external source — typically a Pioneer CDJ on the network — and is driven by ProDJ Link beat packets in real time. Its visual scroll velocity is scaled by `fader_speed` so it stays locked relative to the audio grid when beatmatched.
+
 ### Protocol compatibility
 
 **ProDJ Link** — Pioneer's proprietary CDJ network protocol, fully documented by the [dysentery](https://github.com/Deep-Symmetry/dysentery) project. FreeDJ-3000 implements announce packets, beat packets, and status packets, allowing it to sync BPM and beat phase with real CDJ hardware on the same network.
-
-**DVS timecode** — The vinyl timecode decoder implements the xwax quadrature demodulation algorithm and supports all major formats:
-- Serato CV02.5 (2500 Hz carrier)
-- Serato 2.5 Legacy
-- Traktor MK2 (2000 Hz carrier)
-- Mixvibes
-- Pioneer RB-VS1-K
 
 ---
 
