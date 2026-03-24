@@ -5,6 +5,7 @@ members = [
     "crates/engine",
     "crates/decode",
     "crates/analysis",
+    "crates/minibpm-sys",
     "crates/timestretch",
     "crates/timecode",
     "crates/link",

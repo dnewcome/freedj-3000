@@ -1,0 +1,11 @@
+[package]
+name        = "minibpm-sys"
+description = "FFI bindings for MiniBPM — fixed-tempo BPM estimator"
+version.workspace   = true
+edition.workspace   = true
+license             = "GPL-2.0-or-later"
+build               = "build.rs"
+links               = "minibpm"
+
+[build-dependencies]
+cc = "1"

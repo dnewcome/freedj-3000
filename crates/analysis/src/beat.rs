@@ -3,17 +3,15 @@
 //! The caller manages chunking.  This struct just sees a stream of mono samples.
 //!
 //! Pipeline:
-//!   1. Bass-focused onset strength signal (80–400 Hz bandpass + rectify + diff)
-//!   2. Broadband onset detector (for bass-light material)
-//!   3. Tempo induction via autocorrelation over a 6s window
-//!   4. Beat phase estimation by maximising onset energy at grid positions
-//!   5. Downbeat detection (bar structure)
-//!   6. Variable-tempo grid refinement (for live recordings)
+//!   1. Tempo detection via MiniBPM (6 s analysis window)
+//!   2. Beat phase estimation by maximising onset energy at grid positions
+//!   3. Downbeat detection (bar structure) — TODO
 
 use std::sync::Arc;
 use opendeck_types::{BeatAnalyzer, BeatGrid};
+use minibpm_sys::MiniBpm;
 
-/// Autocorrelation window length in seconds.
+/// Analysis window length in seconds fed to MiniBPM.
 const AC_WINDOW_SEC: f32 = 6.0;
 /// Minimum BPM to consider.
 const BPM_MIN: f32 = 60.0;
@@ -25,19 +23,13 @@ const WARM_UP_SEC: f32 = 5.0;
 const STABLE_SEC: f32 = 15.0;
 
 pub struct BeatAnalyzerImpl {
-    sample_rate:    u32,
+    sample_rate: u32,
     /// Accumulated mono samples (downmixed).
-    samples:        Vec<f32>,
+    samples:     Vec<f32>,
     /// Current best grid estimate.
-    grid:           Option<Arc<BeatGrid>>,
-    /// True once we have STABLE_SEC of audio and confidence is high.
-    stable:         bool,
-    /// Simple one-pole IIR state for the bass bandpass.
-    lp_state:       f32,
-    hp_state:       f32,
-    prev_rectified: f32,
-    /// Best (bpm, confidence) seen across all analysis runs.
-    best_attempt:   Option<(f32, f32)>,
+    grid:        Option<Arc<BeatGrid>>,
+    /// True once we have STABLE_SEC of audio.
+    stable:      bool,
 }
 
 impl BeatAnalyzerImpl {
@@ -47,10 +39,6 @@ impl BeatAnalyzerImpl {
             samples: Vec::with_capacity(sample_rate as usize * 60),
             grid: None,
             stable: false,
-            lp_state: 0.0,
-            hp_state: 0.0,
-            prev_rectified: 0.0,
-            best_attempt: None,
         }
     }
 
@@ -66,37 +54,36 @@ impl BeatAnalyzerImpl {
         }
 
         // Use the last AC_WINDOW_SEC of audio.
-        let window = &self.samples[self.samples.len() - ac_len..];
+        let window_start = self.samples.len() - ac_len;
+        let window = &self.samples[window_start..];
 
-        // ── Stage 1: onset strength signal ────────────────────────────────────
+        // ── Stage 1: tempo via MiniBPM ────────────────────────────────────────
+        let mut detector = MiniBpm::new(sr);
+        detector.set_bpm_range(BPM_MIN as f64, BPM_MAX as f64);
+        let bpm = match detector.estimate_tempo(window) {
+            Some(b) => {
+                log::info!("MiniBPM: {:.1} BPM", b);
+                b as f32
+            }
+            None => {
+                log::debug!("MiniBPM returned no estimate");
+                return;
+            }
+        };
+
+        // ── Stage 2: beat phase ───────────────────────────────────────────────
         let onset = onset_strength(window, sr);
+        let anchor_sample = estimate_anchor(&onset, bpm, sr, window_start);
 
-        // ── Stage 2: autocorrelation → tempo ──────────────────────────────────
-        let (bpm, confidence) = estimate_bpm(&onset, sr);
-        let is_best = self.best_attempt.map_or(true, |(_, c)| confidence > c);
-        if is_best {
-            self.best_attempt = Some((bpm, confidence));
-            log::info!("BPM candidate: {:.1} BPM, confidence {:.3}", bpm, confidence);
-        }
-        if confidence < 0.3 {
-            return;
-        }
-
-        // ── Stage 3: beat phase ───────────────────────────────────────────────
-        let anchor_sample = estimate_anchor(&onset, bpm, sr, self.samples.len() - ac_len);
-
-        // ── Stage 4: downbeat ─────────────────────────────────────────────────
+        // ── Stage 3: downbeat ─────────────────────────────────────────────────
         // TODO: implement bar-level autocorrelation
 
+        // MiniBPM doesn't return a confidence score; use a fixed value.
+        const CONFIDENCE: f32 = 0.8;
         let mut grid = BeatGrid::new_constant(anchor_sample as u64, bpm as f64);
-        grid.confidence = confidence;
+        grid.confidence = CONFIDENCE;
 
-        let secs = self.seconds_accumulated();
-        self.stable = secs >= STABLE_SEC && confidence >= 0.7;
-        if self.stable {
-            grid.locked = false; // locked only by manual user action
-        }
-
+        self.stable = self.seconds_accumulated() >= STABLE_SEC;
         self.grid = Some(Arc::new(grid));
     }
 }
@@ -208,49 +195,6 @@ fn onset_strength(samples: &[f32], sr: f32) -> Vec<f32> {
     }
 
     onset
-}
-
-/// Autocorrelation-based BPM estimation.
-/// Returns (bpm, confidence 0–1).
-fn estimate_bpm(onset: &[f32], sr: f32) -> (f32, f32) {
-    if onset.len() < 64 {
-        return (120.0, 0.0);
-    }
-
-    const HOP: usize = 512;
-    let hop_rate = sr / HOP as f32; // onsets per second
-
-    let min_lag = (hop_rate * 60.0 / BPM_MAX) as usize;
-    let max_lag = (hop_rate * 60.0 / BPM_MIN) as usize;
-    let max_lag = max_lag.min(onset.len() - 1);
-
-    if min_lag >= max_lag {
-        return (120.0, 0.0);
-    }
-
-    let mut best_lag = min_lag;
-    let mut best_val = f32::NEG_INFINITY;
-
-    for lag in min_lag..=max_lag {
-        let ac: f32 = onset.iter().zip(onset[lag..].iter()).map(|(a, b)| a * b).sum();
-        if ac > best_val {
-            best_val = ac;
-            best_lag = lag;
-        }
-    }
-
-    let bpm = hop_rate * 60.0 / best_lag as f32;
-
-    // Normalise confidence: ratio of peak to mean of the AC range.
-    let mean: f32 = {
-        let sum: f32 = (min_lag..=max_lag)
-            .map(|lag| onset.iter().zip(onset[lag..].iter()).map(|(a, b)| a * b).sum::<f32>())
-            .sum();
-        sum / (max_lag - min_lag + 1) as f32
-    };
-    let confidence = if mean > 0.0 { (best_val / mean - 1.0).clamp(0.0, 1.0) } else { 0.0 };
-
-    (bpm, confidence)
 }
 
 /// Find the beat anchor sample by maximising onset energy at grid positions.
