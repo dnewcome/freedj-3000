@@ -105,15 +105,23 @@ impl Transport {
             }
 
             // Handle crossfade on slip release.
-            let [l, r] = if let Some(ref mut xf) = self.slip.crossfade {
-                let from = self.read_frame_at(xf.from_pos, pcm_ring);
-                let to   = self.read_frame_at(xf.to_pos,   pcm_ring);
-                let t    = smooth_step(xf.sample_index as f32 / xf.length as f32);
-                xf.from_pos = self.advance(xf.from_pos, 1.0);
-                xf.to_pos   = self.advance(xf.to_pos,   1.0);
+            let [l, r] = if let Some(xf) = self.slip.crossfade.as_mut() {
+                let from_pos = xf.from_pos;
+                let to_pos   = xf.to_pos;
+                let t        = smooth_step(xf.sample_index as f32 / xf.length as f32);
                 xf.sample_index += 1;
-                if xf.sample_index >= xf.length {
-                    self.active_pos = xf.to_pos;
+                let done = xf.sample_index >= xf.length;
+                drop(xf);
+                let from     = self.read_frame_at(from_pos, pcm_ring);
+                let to       = self.read_frame_at(to_pos,   pcm_ring);
+                let new_from = self.advance(from_pos, 1.0);
+                let new_to   = self.advance(to_pos,   1.0);
+                if let Some(xf) = self.slip.crossfade.as_mut() {
+                    xf.from_pos = new_from;
+                    xf.to_pos   = new_to;
+                }
+                if done {
+                    self.active_pos = new_to;
                     self.slip.crossfade = None;
                 }
                 [lerp(from[0], to[0], t), lerp(from[1], to[1], t)]

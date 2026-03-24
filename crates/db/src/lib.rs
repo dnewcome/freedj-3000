@@ -242,8 +242,9 @@ impl Library {
         })?;
         for row in rows {
             let cue = row?;
-            if (cue.slot as usize) < 8 {
-                map.hot_cues[cue.slot as usize] = Some(cue);
+            let slot = cue.slot as usize;
+            if slot < 8 {
+                map.hot_cues[slot] = Some(cue);
             }
         }
         Ok(map)

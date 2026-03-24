@@ -18,20 +18,26 @@ use winit::window::Window;
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct WaveformParams {
     /// Index of the column at the horizontal centre of the screen (float).
-    playhead_col:  f32,
+    playhead_col:     f32,
     /// How many columns are visible across the full screen width.
-    cols_visible:  f32,
+    cols_visible:     f32,
     /// Total number of valid columns in the buffer.
-    num_cols:      f32,
+    num_cols:         f32,
     /// Surface width in pixels.
-    screen_w:      f32,
+    screen_w:         f32,
     /// Surface height in pixels.
-    screen_h:      f32,
+    screen_h:         f32,
     /// Beat grid: column index of anchor beat (0 if no grid).
-    beat_anchor_col: f32,
+    beat_anchor_col:  f32,
     /// Beat grid: columns per beat (0 if no grid).
     beat_period_cols: f32,
-    _pad:          f32,
+    /// Which beat within the bar beat 0 falls on (0 = beat 0 is a downbeat).
+    downbeat_offset:  f32,
+    /// Beats per bar (4 for 4/4).
+    beats_per_bar:    f32,
+    _pad0:            f32,
+    _pad1:            f32,
+    _pad2:            f32,
 }
 
 // ── Renderer ──────────────────────────────────────────────────────────────────
@@ -128,14 +134,18 @@ impl Renderer {
 
         // ── Params uniform buffer ─────────────────────────────────────────────
         let initial_params = WaveformParams {
-            playhead_col:      0.0,
-            cols_visible:      600.0,
-            num_cols:          num_cols as f32,
-            screen_w:          size.width as f32,
-            screen_h:          size.height as f32,
-            beat_anchor_col:   0.0,
-            beat_period_cols:  0.0,
-            _pad:              0.0,
+            playhead_col:     0.0,
+            cols_visible:     600.0,
+            num_cols:         num_cols as f32,
+            screen_w:         size.width as f32,
+            screen_h:         size.height as f32,
+            beat_anchor_col:  0.0,
+            beat_period_cols: 0.0,
+            downbeat_offset:  0.0,
+            beats_per_bar:    4.0,
+            _pad0:            0.0,
+            _pad1:            0.0,
+            _pad2:            0.0,
         };
         let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label:    Some("waveform_params"),
@@ -271,23 +281,27 @@ impl Renderer {
         let hop_size     = opendeck_analysis::waveform::HOP_SIZE as f32;
         let playhead_col = playhead_sample as f32 / channels as f32 / hop_size;
 
-        let (beat_anchor_col, beat_period_cols) = beat_grid
+        let (beat_anchor_col, beat_period_cols, downbeat_offset, beats_per_bar) = beat_grid
             .map(|g| {
-                let anchor = g.anchor_sample as f32 / channels as f32 / hop_size;
-                let period = (sample_rate as f32 * 60.0 / g.bpm as f32) / channels as f32 / hop_size;
-                (anchor, period)
+                let anchor = g.anchor_sample as f32 / hop_size;
+                let period = (sample_rate as f32 * 60.0 / g.bpm as f32) / hop_size;
+                (anchor, period, g.downbeat_offset as f32, 4.0f32)
             })
-            .unwrap_or((0.0, 0.0));
+            .unwrap_or((0.0, 0.0, 0.0, 4.0));
 
         let params = WaveformParams {
             playhead_col,
-            cols_visible:      600.0,
-            num_cols:          self.num_cols as f32,
-            screen_w:          self.surface_config.width  as f32,
-            screen_h:          self.surface_config.height as f32,
+            cols_visible:     600.0,
+            num_cols:         self.num_cols as f32,
+            screen_w:         self.surface_config.width  as f32,
+            screen_h:         self.surface_config.height as f32,
             beat_anchor_col,
             beat_period_cols,
-            _pad:              0.0,
+            downbeat_offset,
+            beats_per_bar,
+            _pad0:            0.0,
+            _pad1:            0.0,
+            _pad2:            0.0,
         };
         self.queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
 
@@ -386,7 +400,11 @@ struct Params {
     screen_h:          f32,
     beat_anchor_col:   f32,  // column of beat 0 (0 = no grid)
     beat_period_cols:  f32,  // columns per beat (0 = no grid)
-    _pad:              f32,
+    downbeat_offset:   f32,  // which beat within the bar is beat 0
+    beats_per_bar:     f32,  // 4 for 4/4
+    _pad0:             f32,
+    _pad1:             f32,
+    _pad2:             f32,
 };
 
 @group(0) @binding(0) var<storage, read> waveform: array<u32>;
@@ -428,13 +446,33 @@ fn fs_main(@builtin(position) frag_pos: vec4<f32>) -> @location(0) vec4<f32> {
     let b   = f32((packed >> 16u) & 0xFFu) / 255.0;
     let amp = f32((packed >> 24u) & 0xFFu) / 255.0;
 
-    // Beat grid tick marks — full-height white lines at each beat position.
+    // Beat grid tick marks.
+    // Downbeats: orange (CDJ-style), 2 columns wide.
+    // Beats:     white, 1 column wide.
     if p.beat_period_cols > 0.0 {
-        let rel      = col_f - p.beat_anchor_col;
-        let beat_pos = rel % p.beat_period_cols;
-        // 1-column-wide tick at the beat boundary.
-        if beat_pos < 1.0 || beat_pos > p.beat_period_cols - 1.0 {
-            return vec4<f32>(1.0, 1.0, 1.0, 0.35);
+        let rel = col_f - p.beat_anchor_col;
+
+        // beat_pos in [0, beat_period_cols) — always positive
+        let beat_pos = ((rel % p.beat_period_cols) + p.beat_period_cols) % p.beat_period_cols;
+
+        // Fractional beat number (may be negative before anchor).
+        let beat_num = floor(rel / p.beat_period_cols);
+
+        // Bar-relative beat after applying the downbeat offset.
+        let bpb      = p.beats_per_bar;
+        let adjusted = ((beat_num + p.downbeat_offset) % bpb + bpb) % bpb;
+        let is_downbeat = adjusted < 0.5;
+
+        let tick_w = select(1.0, 2.0, is_downbeat);
+
+        if beat_pos < tick_w || beat_pos > p.beat_period_cols - tick_w {
+            if is_downbeat {
+                // Red downbeat (beat 1) marker.
+                return vec4<f32>(1.0, 0.15, 0.15, 1.0);
+            } else {
+                // White beat marker.
+                return vec4<f32>(1.0, 1.0, 1.0, 0.85);
+            }
         }
     }
 

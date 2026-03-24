@@ -36,6 +36,8 @@ pub struct BeatAnalyzerImpl {
     lp_state:       f32,
     hp_state:       f32,
     prev_rectified: f32,
+    /// Best (bpm, confidence) seen across all analysis runs.
+    best_attempt:   Option<(f32, f32)>,
 }
 
 impl BeatAnalyzerImpl {
@@ -48,6 +50,7 @@ impl BeatAnalyzerImpl {
             lp_state: 0.0,
             hp_state: 0.0,
             prev_rectified: 0.0,
+            best_attempt: None,
         }
     }
 
@@ -70,6 +73,11 @@ impl BeatAnalyzerImpl {
 
         // ── Stage 2: autocorrelation → tempo ──────────────────────────────────
         let (bpm, confidence) = estimate_bpm(&onset, sr);
+        let is_best = self.best_attempt.map_or(true, |(_, c)| confidence > c);
+        if is_best {
+            self.best_attempt = Some((bpm, confidence));
+            log::info!("BPM candidate: {:.1} BPM, confidence {:.3}", bpm, confidence);
+        }
         if confidence < 0.3 {
             return;
         }
@@ -100,6 +108,8 @@ impl BeatAnalyzer for BeatAnalyzerImpl {
             "sample rate changed mid-stream — re-create the analyzer");
 
         // Assume interleaved stereo input.
+        let sr = self.sample_rate as usize;
+        let prev_len = self.samples.len();
         for chunk in samples.chunks(2) {
             let mono = if chunk.len() == 2 {
                 (chunk[0] + chunk[1]) * 0.5
@@ -109,12 +119,15 @@ impl BeatAnalyzer for BeatAnalyzerImpl {
             self.samples.push(mono);
         }
 
-        // Re-run analysis every ~1 second of new data after warm-up.
-        let sr = self.sample_rate as usize;
-        if self.samples.len() >= (WARM_UP_SEC * self.sample_rate as f32) as usize
-            && self.samples.len() % sr < 2048
-        {
-            self.run_analysis();
+        // Re-run analysis once per second of new data after warm-up.
+        let warm_up = (WARM_UP_SEC * self.sample_rate as f32) as usize;
+        let new_len = self.samples.len();
+        if new_len >= warm_up {
+            let prev_sec = prev_len / sr;
+            let new_sec  = new_len  / sr;
+            if new_sec > prev_sec {
+                self.run_analysis();
+            }
         }
     }
 
