@@ -35,9 +35,11 @@ struct WaveformParams {
     downbeat_offset:  f32,
     /// Beats per bar (4 for 4/4).
     beats_per_bar:    f32,
-    _pad0:            f32,
-    _pad1:            f32,
-    _pad2:            f32,
+    /// Second beat grid: fractional beat phase 0.0–1.0 (wall-clock time).
+    beat2_phase_beats: f32,
+    /// Second beat grid: columns per beat (0 if disabled).
+    beat2_period_cols: f32,
+    _pad:             f32,
 }
 
 // ── Renderer ──────────────────────────────────────────────────────────────────
@@ -139,13 +141,13 @@ impl Renderer {
             num_cols:         num_cols as f32,
             screen_w:         size.width as f32,
             screen_h:         size.height as f32,
-            beat_anchor_col:  0.0,
-            beat_period_cols: 0.0,
-            downbeat_offset:  0.0,
-            beats_per_bar:    4.0,
-            _pad0:            0.0,
-            _pad1:            0.0,
-            _pad2:            0.0,
+            beat_anchor_col:   0.0,
+            beat_period_cols:  0.0,
+            downbeat_offset:   0.0,
+            beats_per_bar:     4.0,
+            beat2_phase_beats: 0.0,
+            beat2_period_cols: 0.0,
+            _pad:              0.0,
         };
         let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label:    Some("waveform_params"),
@@ -270,6 +272,9 @@ impl Renderer {
         sample_rate:      u32,
         channels:         u8,
         beat_grid:        Option<&BeatGrid>,
+        fader_speed:       f32,   // stable pitch-fader speed (no jog nudge)
+        beat2_bpm:         f32,   // 0.0 = disabled
+        beat2_phase_beats: f32,  // wall-clock beat phase 0.0–1.0
         egui_ctx:         &egui::Context,
         full_output:      egui::FullOutput,
     ) {
@@ -289,19 +294,31 @@ impl Renderer {
             })
             .unwrap_or((0.0, 0.0, 0.0, 4.0));
 
+        // Scale B2 period by fader_speed so the B2 strip scrolls at the same
+        // visual velocity as the audio beat grid.  Audio markers scroll at
+        // fader_speed × (sr/hop) px/s; unscaled B2 always scrolls at 1×(sr/hop).
+        // Multiplying beat2_period_cols by fader_speed corrects this, and at
+        // perfect beatmatch (beat2_bpm = g.bpm × fader_speed) the two periods
+        // are equal, giving matching density AND velocity.
+        let beat2_period_cols = if beat2_bpm > 0.0 {
+            (sample_rate as f32 * 60.0 / beat2_bpm) / hop_size * fader_speed
+        } else {
+            0.0
+        };
+
         let params = WaveformParams {
             playhead_col,
-            cols_visible:     600.0,
-            num_cols:         self.num_cols as f32,
-            screen_w:         self.surface_config.width  as f32,
-            screen_h:         self.surface_config.height as f32,
+            cols_visible:      600.0,
+            num_cols:          self.num_cols as f32,
+            screen_w:          self.surface_config.width  as f32,
+            screen_h:          self.surface_config.height as f32,
             beat_anchor_col,
             beat_period_cols,
             downbeat_offset,
             beats_per_bar,
-            _pad0:            0.0,
-            _pad1:            0.0,
-            _pad2:            0.0,
+            beat2_phase_beats,
+            beat2_period_cols,
+            _pad:              0.0,
         };
         self.queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
 
@@ -393,18 +410,18 @@ const WAVEFORM_WGSL: &str = r#"
 //   bits 24-31: A (overall amplitude, controls bar height)
 
 struct Params {
-    playhead_col:      f32,  // column index at screen center
-    cols_visible:      f32,  // columns visible across full width
-    num_cols:          f32,  // number of valid columns in the buffer
-    screen_w:          f32,
-    screen_h:          f32,
-    beat_anchor_col:   f32,  // column of beat 0 (0 = no grid)
-    beat_period_cols:  f32,  // columns per beat (0 = no grid)
-    downbeat_offset:   f32,  // which beat within the bar is beat 0
-    beats_per_bar:     f32,  // 4 for 4/4
-    _pad0:             f32,
-    _pad1:             f32,
-    _pad2:             f32,
+    playhead_col:       f32,  // column index at screen center
+    cols_visible:       f32,  // columns visible across full width
+    num_cols:           f32,  // number of valid columns in the buffer
+    screen_w:           f32,
+    screen_h:           f32,
+    beat_anchor_col:    f32,  // column of beat 0 (0 = no grid)
+    beat_period_cols:   f32,  // columns per beat (0 = no grid)
+    downbeat_offset:    f32,  // which beat within the bar is beat 0
+    beats_per_bar:      f32,  // 4 for 4/4
+    beat2_phase_beats:  f32,  // wall-clock beat phase 0.0–1.0
+    beat2_period_cols:  f32,  // second beat grid columns per beat (0 = disabled)
+    _pad:               f32,
 };
 
 @group(0) @binding(0) var<storage, read> waveform: array<u32>;
@@ -432,6 +449,21 @@ fn fs_main(@builtin(position) frag_pos: vec4<f32>) -> @location(0) vec4<f32> {
     // Map screen x → column index.
     let half  = p.cols_visible * 0.5;
     let col_f = (p.playhead_col - half) + sx * p.cols_visible;
+
+    // Second beat grid — 40 px strip at the bottom, screen-space (not audio-time).
+    // Advances on wall-clock time via beat2_phase_beats so it doesn't scroll
+    // with the audio waveform.
+    if frag_pos.y > p.screen_h - 40.0 && p.beat2_period_cols > 0.0 {
+        let pixels_per_beat = p.beat2_period_cols * p.screen_w / p.cols_visible;
+        let phase_px        = p.beat2_phase_beats * pixels_per_beat;
+        // Add phase_px so markers drift left as phase increases (same direction
+        // as the waveform scroll).
+        let beat_x = ((frag_pos.x + phase_px) % pixels_per_beat + pixels_per_beat) % pixels_per_beat;
+        if beat_x < 3.0 || beat_x > pixels_per_beat - 3.0 {
+            return vec4<f32>(0.0, 1.0, 1.0, 1.0);  // bright cyan beat marker
+        }
+        return vec4<f32>(0.0, 0.05, 0.15, 1.0);    // dark blue strip background
+    }
 
     // Out of track range → dark background.
     if col_f < 0.0 || col_f >= p.num_cols {

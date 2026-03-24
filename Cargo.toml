@@ -78,7 +78,7 @@ rusqlite    = { version = "0.31", features = ["bundled"] }
 
 # Networking (ProDJ Link, Ableton Link)
 tokio       = { version = "1", features = ["full"] }
-socket2     = "0.5"
+socket2     = { version = "0.5", features = ["all"] }
 
 # Shared state between threads
 arc-swap    = "1"

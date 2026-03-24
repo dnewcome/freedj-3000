@@ -9,6 +9,7 @@
 
 mod audio;
 mod midi;
+mod prodj;
 mod renderer;
 
 use anyhow::{bail, Context, Result};
@@ -19,7 +20,7 @@ use renderer::Renderer;
 use std::{
     path::PathBuf,
     sync::{
-        atomic::Ordering,
+        atomic::{AtomicU32, AtomicU64, Ordering},
         Arc,
     },
     time::{Duration, Instant},
@@ -39,10 +40,18 @@ const FRAME_INTERVAL: Duration = Duration::from_micros(16_667);
 
 struct DeckApp {
     // Provided before event loop starts.
-    path:        PathBuf,
-    waveform:    WaveformCache,
-    audio:       AudioHandle,
-    beat_grid:   Option<BeatGrid>,
+    path:         PathBuf,
+    waveform:     WaveformCache,
+    audio:        AudioHandle,
+    beat_grid:    Option<BeatGrid>,
+
+    // Second beat grid — tempo controlled by Deck B on the MIDI controller.
+    fader_speed:  Arc<AtomicU32>,  // f32 bits; pitch-fader speed (no jog nudge)
+    beat2_bpm:    Arc<AtomicU32>,  // f32 bits; BPM of the second grid
+    beat2_anchor: Arc<AtomicU64>, // written by MIDI Cue B to signal a phase reset
+    beat2_start:  Instant,        // wall-clock time of the last phase reset
+    prev_beat2_anchor: u64,       // detect changes in beat2_anchor
+    prev_beat2_bpm:    f32,       // detect BPM changes for logging
 
     // Created on first `resumed`.
     window:      Option<Arc<Window>>,
@@ -55,12 +64,26 @@ struct DeckApp {
 }
 
 impl DeckApp {
-    fn new(path: PathBuf, waveform: WaveformCache, audio: AudioHandle, beat_grid: Option<BeatGrid>) -> Self {
+    fn new(
+        path:         PathBuf,
+        waveform:     WaveformCache,
+        audio:        AudioHandle,
+        beat_grid:    Option<BeatGrid>,
+        fader_speed:  Arc<AtomicU32>,
+        beat2_bpm:    Arc<AtomicU32>,
+        beat2_anchor: Arc<AtomicU64>,
+    ) -> Self {
         Self {
             path,
             waveform,
             audio,
             beat_grid,
+            fader_speed,
+            beat2_bpm,
+            beat2_anchor,
+            beat2_start:       Instant::now(),
+            prev_beat2_anchor: 0,
+            prev_beat2_bpm:    0.0,
             window:      None,
             renderer:    None,
             egui_ctx:    egui::Context::default(),
@@ -81,9 +104,30 @@ impl DeckApp {
             _ => return,
         };
 
-        let pos       = self.audio.position.load(Ordering::Relaxed);
-        let playing   = self.audio.playing.load(Ordering::Relaxed);
-        let speed     = self.audio.speed_load();
+        let pos          = self.audio.position.load(Ordering::Relaxed);
+        let playing      = self.audio.playing.load(Ordering::Relaxed);
+        let speed        = self.audio.speed_load();
+        let fader_speed  = f32::from_bits(self.fader_speed.load(Ordering::Relaxed));
+        let beat2_bpm    = f32::from_bits(self.beat2_bpm.load(Ordering::Relaxed));
+        let beat2_anchor = self.beat2_anchor.load(Ordering::Relaxed);
+
+        // Log when beat2_bpm changes (confirms ProDJ data is reaching the renderer).
+        if (beat2_bpm - self.prev_beat2_bpm).abs() > 0.01 {
+            log::info!("render: beat2_bpm updated {:.2} → {:.2}", self.prev_beat2_bpm, beat2_bpm);
+            self.prev_beat2_bpm = beat2_bpm;
+        }
+
+        // Reset the phase timer whenever the MIDI Cue B button is pressed.
+        if beat2_anchor != self.prev_beat2_anchor {
+            self.beat2_start       = Instant::now();
+            self.prev_beat2_anchor = beat2_anchor;
+        }
+        let beat2_phase_beats = if beat2_bpm > 0.0 {
+            let elapsed = self.beat2_start.elapsed().as_secs_f32();
+            (elapsed * beat2_bpm / 60.0).fract()
+        } else {
+            0.0
+        };
         let sr        = self.audio.sample_rate;
         let ch        = self.audio.channels as u64;
         let total_s   = self.audio.samples.len() as f64 / sr as f64 / ch as f64;
@@ -137,6 +181,12 @@ impl DeckApp {
                             );
                         }
                         ui.separator();
+                        ui.label(
+                            egui::RichText::new(format!("B2: {beat2_bpm:.1} BPM"))
+                                .color(egui::Color32::from_rgb(0, 220, 220))
+                                .monospace(),
+                        );
+                        ui.separator();
                         let speed_color = if (speed - 1.0).abs() < 0.01 {
                             egui::Color32::DARK_GRAY
                         } else {
@@ -165,6 +215,9 @@ impl DeckApp {
             sr,
             self.audio.channels,
             self.beat_grid.as_ref(),
+            fader_speed,
+            beat2_bpm,
+            beat2_phase_beats,
             &self.egui_ctx,
             output,
         );
@@ -178,7 +231,7 @@ impl ApplicationHandler for DeckApp {
         }
 
         let attrs = WindowAttributes::default()
-            .with_title("OpenDeck")
+            .with_title("freedj-3000")
             .with_inner_size(winit::dpi::LogicalSize::new(1280u32, 480u32));
 
         let window = Arc::new(
@@ -343,21 +396,37 @@ fn main() -> Result<()> {
         ),
     }
 
-    // ── 3. Connect MIDI controller (optional — app runs fine without it) ─────────
+    // ── 3. Create second beat grid state ─────────────────────────────────────
+    let base_bpm     = beat_grid.as_ref().map(|g| g.bpm as f32).unwrap_or(120.0);
+    let fader_speed  = Arc::new(AtomicU32::new(1.0f32.to_bits()));
+    let beat2_bpm    = Arc::new(AtomicU32::new(base_bpm.to_bits()));
+    let beat2_anchor = Arc::new(AtomicU64::new(0));
+
+    // ── 4. Start ProDJ Link listener (optional — app runs fine without it) ────────
+    let _prodj = prodj::ProDjHandle::listen(
+        Arc::clone(&beat2_bpm),
+        Arc::clone(&beat2_anchor),
+    );
+
+    // ── 5. Connect MIDI controller (optional — app runs fine without it) ──────────
     let _midi = midi::MidiHandle::connect(
         Arc::clone(&audio.playing),
         Arc::clone(&audio.position),
         Arc::clone(&audio.speed),
+        Arc::clone(&fader_speed),
         audio.sample_rate,
         audio.channels,
         audio.samples.len(),
+        Arc::clone(&beat2_bpm),
+        Arc::clone(&beat2_anchor),
+        base_bpm,
     );
 
-    // ── 4. Run the UI event loop ──────────────────────────────────────────────
+    // ── 6. Run the UI event loop ──────────────────────────────────────────────
     let event_loop = EventLoop::new().context("failed to create event loop")?;
     event_loop.set_control_flow(ControlFlow::Wait);
 
-    let mut app = DeckApp::new(path, waveform, audio, beat_grid);
+    let mut app = DeckApp::new(path, waveform, audio, beat_grid, fader_speed, beat2_bpm, beat2_anchor);
     event_loop.run_app(&mut app).context("event loop error")?;
 
     Ok(())
