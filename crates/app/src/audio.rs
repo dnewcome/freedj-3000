@@ -277,9 +277,23 @@ fn processor_loop(
         // (e.g. at 0.25× it outputs 4× input frames).  BACK_PRESSURE_SLOTS is
         // sized at 8× BLOCK_FRAMES × device_ch to guarantee we always have room
         // for the worst-case output before we process the next block.
-        if producer.slots() < BACK_PRESSURE_SLOTS {
-            thread::sleep(Duration::from_millis(1));
+        //
+        // Sleep duration is proportional to how full the buffer is: when nearly
+        // full (just above threshold) sleep ~5ms; when empty sleep ~0ms.  This
+        // avoids both glitches (sleeping too long when buffer drains fast) and
+        // CPU spin (sleeping too little when buffer is comfortably full).
+        let free = producer.slots();
+        if free < BACK_PRESSURE_SLOTS {
+            thread::sleep(Duration::from_millis(5));
             continue;
+        }
+        // Buffer has room — sleep proportionally so we don't spin hot.
+        // At 1× speed, one BLOCK_FRAMES = ~11.6ms of audio, so sleeping
+        // (buffer_fill_ratio × 8ms) keeps us well ahead without wasting CPU.
+        let fill_ratio = 1.0 - (free as f32 / RING_BUFFER_SAMPLES as f32);
+        let yield_ms   = (fill_ratio * 8.0) as u64;
+        if yield_ms > 0 {
+            thread::sleep(Duration::from_millis(yield_ms));
         }
 
         // ── End of track ──────────────────────────────────────────────────────

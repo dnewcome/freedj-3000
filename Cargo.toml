@@ -99,6 +99,7 @@ pollster    = "0.3"
 opt-level   = 3
 lto         = "thin"
 codegen-units = 1
+debug       = 1   # line-level debug info for flamegraph / perf; stripped in dist builds
 
 # The audio engine binary must never be a debug build in prod.
 # Use: cargo build --release -p opendeck-app

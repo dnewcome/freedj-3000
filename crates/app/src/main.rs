@@ -22,7 +22,7 @@ use std::{
         atomic::Ordering,
         Arc,
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 use winit::{
     application::ApplicationHandler,
@@ -34,18 +34,24 @@ use winit::{
 
 // ── App state ─────────────────────────────────────────────────────────────────
 
+/// Target frame interval — 60 fps.
+const FRAME_INTERVAL: Duration = Duration::from_micros(16_667);
+
 struct DeckApp {
     // Provided before event loop starts.
-    path:       PathBuf,
-    waveform:   WaveformCache,
-    audio:      AudioHandle,
-    beat_grid:  Option<BeatGrid>,
+    path:        PathBuf,
+    waveform:    WaveformCache,
+    audio:       AudioHandle,
+    beat_grid:   Option<BeatGrid>,
 
     // Created on first `resumed`.
-    window:     Option<Arc<Window>>,
-    renderer:   Option<Renderer>,
-    egui_ctx:   egui::Context,
-    egui_state: Option<egui_winit::State>,
+    window:      Option<Arc<Window>>,
+    renderer:    Option<Renderer>,
+    egui_ctx:    egui::Context,
+    egui_state:  Option<egui_winit::State>,
+
+    /// Time of the last rendered frame, used to cap to FRAME_INTERVAL.
+    last_render: Instant,
 }
 
 impl DeckApp {
@@ -55,14 +61,17 @@ impl DeckApp {
             waveform,
             audio,
             beat_grid,
-            window:     None,
-            renderer:   None,
-            egui_ctx:   egui::Context::default(),
-            egui_state: None,
+            window:      None,
+            renderer:    None,
+            egui_ctx:    egui::Context::default(),
+            egui_state:  None,
+            last_render: Instant::now(),
         }
     }
 
     fn render_frame(&mut self) {
+        self.last_render = Instant::now();
+
         let (renderer, egui_state, window) = match (
             self.renderer.as_mut(),
             self.egui_state.as_mut(),
@@ -279,12 +288,18 @@ impl ApplicationHandler for DeckApp {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        // Drive continuous animation from outside the event handler so
-        // Wayland compositors get a consistent redraw cadence.
-        if let Some(w) = &self.window {
-            w.request_redraw();
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Request one redraw per frame interval.  Fifo vsync makes wgpu block
+        // inside present() until the display is ready, so the thread sleeps in
+        // the driver rather than spinning.  WaitUntil is a belt-and-suspenders
+        // guard for compositors that deliver frame callbacks faster than vsync.
+        let next = self.last_render + FRAME_INTERVAL;
+        if Instant::now() >= next {
+            if let Some(w) = &self.window {
+                w.request_redraw();
+            }
         }
+        event_loop.set_control_flow(ControlFlow::WaitUntil(next));
     }
 }
 
@@ -340,7 +355,7 @@ fn main() -> Result<()> {
 
     // ── 4. Run the UI event loop ──────────────────────────────────────────────
     let event_loop = EventLoop::new().context("failed to create event loop")?;
-    event_loop.set_control_flow(ControlFlow::Poll);
+    event_loop.set_control_flow(ControlFlow::Wait);
 
     let mut app = DeckApp::new(path, waveform, audio, beat_grid);
     event_loop.run_app(&mut app).context("event loop error")?;
