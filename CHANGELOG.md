@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Previously working (documented here for completeness)
+- **Key lock / timestretching**: pitch-preserving speed change via Rubber Band R3
+  (`crates/timestretch/`), active across the full ±16% pitch range.
+
 ### Added
 - **ProDJ Link listener** (`crates/app/src/prodj.rs`): UDP listener on port 50002
   receives Pioneer CDJ/XDJ beat packets and drives the second beat grid in real

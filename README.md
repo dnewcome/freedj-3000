@@ -31,7 +31,7 @@ This project takes the position that DJ equipment protocols are infrastructure, 
 | MIDI controller input | ✅ Working |
 | ProDJ Link beat sync (receive) | ✅ Working |
 | Cue points / loops | 📋 Planned |
-| Key lock / timestretching | 📋 Planned |
+| Key lock / timestretching | ✅ Working |
 | Hardware control surface | 📋 Planned |
 | rekordbox library import | 📋 Planned |
 
@@ -152,9 +152,9 @@ The UI philosophy is a **game HUD**, not an application. Every frame redraws the
 
 ### Audio engine
 
-The audio engine runs on an isolated real-time thread (SCHED_FIFO, mlockall) and communicates with the UI via lock-free atomics. The callback-based cpal stream advances an `AtomicU64` position counter that the renderer reads each frame.
+The audio engine runs on an isolated real-time thread and communicates with the UI via lock-free atomics. The callback-based cpal stream advances an `AtomicU64` position counter that the renderer reads each frame.
 
-Planned: the full transport supports slip mode (dual position tracking with crossfade on release), hot cues, saved loops, and key lock. These are wired up in `crates/engine/` but not yet connected to the UI.
+Speed changes use the Rubber Band R3 time-stretcher (`crates/timestretch/`) for key-locked pitch-preserving playback across the full ±16% pitch range. Planned: slip mode, hot cues, saved loops.
 
 ### Waveform analysis
 
